@@ -61,7 +61,7 @@ struct Cli {
     #[arg(long)]
     http_basic: Option<String>,
 
-    /// Disable HTTP authentication
+    /// Disable HTTP authentication：1 or 0
     #[arg(long, value_parser = value_parser ! (u8).range(0..=1), default_value_t = 1)]
     no_httpauth: u8,
 }
