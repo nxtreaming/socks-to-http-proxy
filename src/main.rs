@@ -5,10 +5,13 @@ use clap::{Args, Parser, value_parser};
 use color_eyre::eyre::Result;
 
 use tokio_socks::tcp::Socks5Stream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 use tracing_subscriber::EnvFilter;
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::AsyncWriteExt;
+use tokio::signal;
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
@@ -23,6 +26,9 @@ use base64::Engine;
 
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+// Global counter for tracking active SOCKS5 connections
+static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Args)]
 #[group()]
@@ -88,26 +94,139 @@ async fn main() -> Result<()> {
     let no_httpauth = args.no_httpauth == 1;
 
     let listener = TcpListener::bind(addr).await?;
-    info!("Listening on http://{}", addr);
+    info!("HTTP Proxy listening on http://{}", addr);
+    info!("SOCKS5 backend: {}", socks_addr);
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
+    // Add a connection monitoring task
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut consecutive_high_count = 0;
 
-        let serve_connection = service_fn(move |req| proxy(req, socks_addr, auth, &http_basic, allowed_domains, no_httpauth));
+        loop {
+            interval.tick().await;
 
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .preserve_header_case(true)
-                .title_case_headers(true)
-                .serve_connection(io, serve_connection)
-                .with_upgrades()
+            let close_wait_cmd = format!("netstat -an | grep CLOSE_WAIT | grep :{} | wc -l", socks_addr.port());
+            let close_wait_count = match tokio::process::Command::new("sh")
+                .args(&["-c", &close_wait_cmd])
+                .output()
                 .await
             {
-                warn!("Failed to serve connection: {:?}", err);
+                Ok(output) => {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or(0)
+                }
+                Err(e) => {
+                    debug!("Failed to check CLOSE_WAIT: {}", e);
+                    0
+                }
+            };
+
+            let active = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+
+            if close_wait_count > 0 || active > 0 {
+                info!("SOCKS5 Status - Active: {}, CLOSE_WAIT: {}", active, close_wait_count);
             }
-        });
+
+            // Alert logic
+            match close_wait_count {
+                0..=10 => {
+                    consecutive_high_count = 0;
+                }
+                11..=100 => {
+                    warn!("Moderate CLOSE_WAIT leak: {} connections", close_wait_count);
+                    consecutive_high_count = 0;
+                }
+                101..=500 => {
+                    warn!("High CLOSE_WAIT leak: {} connections", close_wait_count);
+                    consecutive_high_count += 1;
+                }
+                _ => {
+                    error!("CRITICAL CLOSE_WAIT leak: {} connections", close_wait_count);
+                    consecutive_high_count += 1;
+                }
+            }
+
+            if consecutive_high_count >= 3 {
+                error!("Persistent connection leak detected for {} intervals", consecutive_high_count);
+            }
+        }
+    });
+
+    // Graceful shutdown signal handling
+    let shutdown = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C handler");
+
+        info!("Shutdown signal received");
+
+        let active = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+        if active > 0 {
+            info!("Waiting for {} SOCKS5 connections to close...", active);
+
+            for i in 1..=30 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+
+                if remaining == 0 {
+                    info!("All connections closed gracefully");
+                    break;
+                }
+
+                if i % 5 == 0 {
+                    info!("Still waiting for {} connections... ({}/30s)", remaining, i);
+                }
+            }
+
+            let final_count = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+            if final_count > 0 {
+                warn!("Forced shutdown with {} connections still active", final_count);
+            }
+        }
+    };
+
+    // Main server loop
+    let server = async {
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            debug!("New connection from {}", peer_addr);
+
+            tokio::task::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(move |req| {
+                    proxy(req, socks_addr, auth, &http_basic, allowed_domains, no_httpauth)
+                });
+
+                if let Err(err) = http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
+                    debug!("Connection from {} ended: {:?}", peer_addr, err);
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), color_eyre::eyre::Error>(())
+    };
+
+    // Run server until the shutdown signal is received
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown => {
+            info!("Server shutdown complete");
+        }
     }
+
+    Ok(())
 }
 
 async fn proxy(
@@ -196,32 +315,72 @@ async fn proxy(
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
-        let stream = match auth {
-            Some(auth) => Socks5Stream::connect_with_password(
-                socks_addr,
-                addr,
-                &auth.username,
-                &auth.password,
-            )
-            .await
-            .unwrap(),
-            None => Socks5Stream::connect(socks_addr, addr).await.unwrap(),
+        let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        debug!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
+
+        let socks_stream = match auth {
+            Some(auth) => {
+                match Socks5Stream::connect_with_password(socks_addr, addr.clone(), &auth.username, &auth.password).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                        warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
+                        let mut resp = Response::new(full("SOCKS5 authentication failed"));
+                        *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                        return Ok(resp);
+                    }
+                }
+            }
+            None => {
+                match Socks5Stream::connect(socks_addr, addr.clone()).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                        warn!("SOCKS5 connection #{} failed: {}", conn_id, e);
+                        let mut resp = Response::new(full("SOCKS5 connection failed"));
+                        *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                        return Ok(resp);
+                    }
+                }
+            }
         };
-        let io = TokioIo::new(stream);
+
+        let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
             .preserve_header_case(true)
             .title_case_headers(true)
             .handshake(io)
             .await?;
-        tokio::task::spawn(async move {
-            if let Err(err) = conn.await {
-                warn!("Connection failed: {:?}", err);
+
+        // 🔥 Critical fix: Ensure the connection is properly managed
+        let conn_handle = tokio::task::spawn(async move {
+            let result = conn.await;
+            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+
+            match result {
+                Ok(_) => debug!("HTTP #{} connection completed, {} active", conn_id, remaining),
+                Err(e) => debug!("HTTP #{} connection ended: {}, {} active", conn_id, e, remaining),
             }
         });
 
-        let resp = sender.send_request(req).await?;
-        Ok(resp.map(|b| b.boxed()))
+        let response = sender.send_request(req).await;
+
+        // Ensure the sender is properly closed
+        drop(sender);
+
+        // Wait for a connection task to complete
+        if let Err(e) = conn_handle.await {
+            warn!("Connection task error: {}", e);
+        }
+
+        match response {
+            Ok(resp) => Ok(resp.map(|b| b.boxed())),
+            Err(e) => {
+                warn!("HTTP request failed: {}", e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -247,24 +406,65 @@ async fn tunnel(
     socks_addr: SocketAddr,
     auth: &Option<Auth>,
 ) -> Result<()> {
-    let mut stream = match auth {
+    let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    debug!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
+
+    let socks_stream = match auth {
         Some(auth) => {
-            Socks5Stream::connect_with_password(socks_addr, addr, &auth.username, &auth.password)
-                .await?
+            match Socks5Stream::connect_with_password(socks_addr, addr.clone(), &auth.username, &auth.password).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                    return Err(color_eyre::eyre::eyre!("SOCKS5 auth connection failed: {}", e));
+                }
+            }
         }
-        None => Socks5Stream::connect(socks_addr, addr).await?,
+        None => {
+            match Socks5Stream::connect(socks_addr, addr.clone()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+                    return Err(color_eyre::eyre::eyre!("SOCKS5 connection failed: {}", e));
+                }
+            }
+        }
     };
 
-    let mut upgraded = TokioIo::new(upgraded);
+    let mut client = TokioIo::new(upgraded);
+    let mut server = socks_stream;
 
-    // Proxying data
-    let (from_client, from_server) =
-        tokio::io::copy_bidirectional(&mut upgraded, &mut stream).await?;
+    let copy_result = tokio::io::copy_bidirectional(&mut client, &mut server).await;
 
-    // Print message when done
-    debug!(
-        "client wrote {} bytes and received {} bytes",
-        from_client, from_server
-    );
+    // 🔥 Critical fix: Force close both ends of the connection
+    let server_shutdown = async {
+        if let Err(e) = server.shutdown().await {
+            debug!("Server shutdown error (normal if danted closed first): {}", e);
+        }
+    };
+
+    let client_shutdown = async {
+        if let Err(e) = client.shutdown().await {
+            debug!("Client shutdown error: {}", e);
+        }
+    };
+
+    tokio::join!(server_shutdown, client_shutdown);
+
+    // Force resource cleanup
+    drop(server);
+    drop(client);
+
+    let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+
+    match copy_result {
+        Ok((from_client, from_server)) => {
+            debug!("Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+                   conn_id, from_client, from_server, remaining);
+        }
+        Err(e) => {
+            debug!("Tunnel #{} ended: {}, {} active", conn_id, e, remaining);
+        }
+    }
+
     Ok(())
 }
