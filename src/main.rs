@@ -188,30 +188,36 @@ async fn main() -> Result<()> {
     };
 
     // Main server loop
-    let server = async {
+    let server = async move {
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            debug!("New connection from {}", peer_addr);
+            match listener.accept().await {
+                Ok((stream, peer_addr)) => {
+                    debug!("New connection from {}", peer_addr);
 
-            tokio::task::spawn(async move {
-                let io = TokioIo::new(stream);
-                let service = service_fn(move |req| {
-                    proxy(req, socks_addr, auth, &http_basic, allowed_domains, no_httpauth)
-                });
+                    tokio::task::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let service = service_fn(move |req| {
+                            proxy(req, socks_addr, auth, &http_basic, allowed_domains, no_httpauth)
+                        });
 
-                if let Err(err) = http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(io, service)
-                    .with_upgrades()
-                    .await
-                {
-                    debug!("Connection from {} ended: {:?}", peer_addr, err);
+                        if let Err(err) = http1::Builder::new()
+                            .preserve_header_case(true)
+                            .title_case_headers(true)
+                            .serve_connection(io, service)
+                            .with_upgrades()
+                            .await
+                        {
+                            debug!("Connection from {} ended: {:?}", peer_addr, err);
+                        }
+                    });
                 }
-            });
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                    // Return an error to break the loop and shutdown gracefully
+                    return Err::<(), color_eyre::eyre::Error>(color_eyre::eyre::eyre!("Accept error: {}", e));
+                }
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), color_eyre::eyre::Error>(())
     };
 
     // Run server until the shutdown signal is received
