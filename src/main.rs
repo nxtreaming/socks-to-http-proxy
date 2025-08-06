@@ -402,7 +402,9 @@ async fn proxy(
         let (closed_tx, closed) = tokio::sync::oneshot::channel();
 
         // Send the request with Connection: close header
-        let resp = sender.send_request(req).await?;
+        let mut resp = sender.send_request(req).await?;
+        resp.headers_mut()
+            .insert("Connection", HeaderValue::from_static("close"));
 
         // Drop the sender to allow the closed future to resolve
         drop(sender);
