@@ -351,7 +351,10 @@ async fn proxy(
             }
         };
 
-        // Back to simple, proven approach
+        // 🔥 Critical fix: Force Connection: close to prevent keep-alive
+        let mut req = req;
+        req.headers_mut().insert("connection", HeaderValue::from_static("close"));
+
         let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
@@ -360,15 +363,31 @@ async fn proxy(
             .handshake(io)
             .await?;
 
+        // Spawn connection handler with proper cleanup
         tokio::task::spawn(async move {
-            if let Err(err) = conn.await {
-                debug!("Connection failed: {:?}", err);
-            }
+            // Set timeout to prevent hanging connections
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                conn
+            ).await;
+
             let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
+
+            match result {
+                Ok(Ok(_)) => debug!("✅ HTTP #{} connection completed, {} active", conn_id, remaining),
+                Ok(Err(e)) => debug!("🔚 HTTP #{} connection ended: {}, {} active", conn_id, e, remaining),
+                Err(_) => {
+                    debug!("⏰ HTTP #{} connection timed out, {} active", conn_id, remaining);
+                }
+            }
         });
 
+        // Send the request with Connection: close header
         let resp = sender.send_request(req).await?;
+
+        // 🔥 Critical fix: Explicitly close sender to signal end
+        drop(sender);
+
         Ok(resp.map(|b| b.boxed()))
 
 
@@ -450,11 +469,11 @@ async fn tunnel(
 
     match copy_result {
         Ok((from_client, from_server)) => {
-            debug!("✅ Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+            debug!("Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
                    conn_id, from_client, from_server, remaining);
         }
         Err(e) => {
-            debug!("🔚 Tunnel #{} ended with error: {}, {} active", conn_id, e, remaining);
+            debug!("Tunnel #{} ended with error: {}, {} active", conn_id, e, remaining);
         }
     }
 
