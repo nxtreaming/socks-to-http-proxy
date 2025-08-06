@@ -351,7 +351,7 @@ async fn proxy(
             }
         };
 
-        // Critical fix: Handle half-closed connections properly
+        // Back to simple, proven approach
         let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
@@ -360,57 +360,16 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Key fix: Handle connection with proper cleanup and timeout
-        let _conn_handle = tokio::task::spawn(async move {
-            // Set a reasonable timeout for the connection
-            let result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(30), // 30 second timeout
-                conn
-            ).await;
-
-            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-
-            match result {
-                Ok(Ok(_)) => {
-                    debug!("HTTP #{} connection completed normally, {} active", conn_id, remaining);
-                }
-                Ok(Err(e)) => {
-                    debug!("HTTP #{} connection ended with error: {}, {} active", conn_id, e, remaining);
-                }
-                Err(_) => {
-                    debug!("HTTP #{} connection timed out, {} active", conn_id, remaining);
-                }
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                debug!("Connection failed: {:?}", err);
             }
+            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
         });
 
-        // Send the request with timeout
-        let response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            sender.send_request(req)
-        ).await;
-
-        // Critical: Always close sender immediately after request
-        drop(sender);
-
-        // Don't wait for connection handle - let it clean up in background
-        // This prevents blocking and allows proper connection cleanup
-
-        match response {
-            Ok(Ok(resp)) => {
-                debug!("HTTP #{} request completed successfully", conn_id);
-                Ok(resp.map(|b| b.boxed()))
-            }
-            Ok(Err(e)) => {
-                debug!("HTTP #{} request failed: {}", conn_id, e);
-                Err(e)
-            }
-            Err(_) => {
-                debug!("HTTP #{} request timed out", conn_id);
-                let mut resp = Response::new(full("Request timeout"));
-                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
-                Ok(resp)
-            }
-        }
+        let resp = sender.send_request(req).await?;
+        Ok(resp.map(|b| b.boxed()))
 
 
     }
@@ -465,11 +424,8 @@ async fn tunnel(
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
 
-    // Critical fix: Add timeout to prevent hanging connections
-    let copy_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(300), // 5 minute timeout for tunnels
-        tokio::io::copy_bidirectional(&mut client, &mut server)
-    ).await;
+    // Simple bidirectional copy
+    let copy_result = tokio::io::copy_bidirectional(&mut client, &mut server).await;
 
     // Critical fix: Always shutdown both ends regardless of copy result
     let server_shutdown = async {
@@ -484,17 +440,7 @@ async fn tunnel(
         }
     };
 
-    // Force shutdown both ends with timeout
-    let shutdown_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        async {
-            tokio::join!(server_shutdown, client_shutdown);
-        }
-    ).await;
-
-    if shutdown_result.is_err() {
-        debug!("🔚 Tunnel #{} shutdown timed out", conn_id);
-    }
+    tokio::join!(server_shutdown, client_shutdown);
 
     // Force resource cleanup
     drop(server);
@@ -503,15 +449,12 @@ async fn tunnel(
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
 
     match copy_result {
-        Ok(Ok((from_client, from_server))) => {
-            debug!("Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+        Ok((from_client, from_server)) => {
+            debug!("✅ Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
                    conn_id, from_client, from_server, remaining);
         }
-        Ok(Err(e)) => {
-            debug!("Tunnel #{} ended with error: {}, {} active", conn_id, e, remaining);
-        }
-        Err(_) => {
-            debug!("Tunnel #{} timed out, {} active", conn_id, remaining);
+        Err(e) => {
+            debug!("🔚 Tunnel #{} ended with error: {}, {} active", conn_id, e, remaining);
         }
     }
 
