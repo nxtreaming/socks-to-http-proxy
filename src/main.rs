@@ -351,7 +351,7 @@ async fn proxy(
             }
         };
 
-        // 🔥 Critical fix: Force Connection: close to prevent keep-alive
+        // Critical fix: Force Connection: close to prevent keep-alive
         let mut req = req;
         req.headers_mut().insert("connection", HeaderValue::from_static("close"));
 
@@ -374,10 +374,10 @@ async fn proxy(
             let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
 
             match result {
-                Ok(Ok(_)) => debug!("✅ HTTP #{} connection completed, {} active", conn_id, remaining),
-                Ok(Err(e)) => debug!("🔚 HTTP #{} connection ended: {}, {} active", conn_id, e, remaining),
+                Ok(Ok(_)) => debug!("HTTP #{} connection completed, {} active", conn_id, remaining),
+                Ok(Err(e)) => debug!("HTTP #{} connection ended: {}, {} active", conn_id, e, remaining),
                 Err(_) => {
-                    debug!("⏰ HTTP #{} connection timed out, {} active", conn_id, remaining);
+                    debug!("HTTP #{} connection timed out, {} active", conn_id, remaining);
                 }
             }
         });
@@ -385,9 +385,12 @@ async fn proxy(
         // Send the request with Connection: close header
         let resp = sender.send_request(req).await?;
 
-        // 🔥 Critical fix: Explicitly close sender to signal end
+        // Explicitly drop sender to release resources
         drop(sender);
 
+        // Critical fix: Ensure response body will be properly handled
+        // The response body must be consumed by the client to prevent CLOSE_WAIT
+        // We return the response as-is, but the HTTP framework will handle consumption
         Ok(resp.map(|b| b.boxed()))
 
 
