@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -70,6 +70,10 @@ struct Cli {
     /// Disable HTTP authentication：1 or 0
     #[arg(long, value_parser = value_parser ! (u8).range(0..=1), default_value_t = 1)]
     no_httpauth: u8,
+
+    /// Idle timeout in seconds for tunnel connections
+    #[arg(long, default_value_t = 540)]
+    idle_timeout: u64,
 }
 
 #[tokio::main]
@@ -94,6 +98,7 @@ async fn main() -> Result<()> {
         .map(|hb| format!("Basic {}", general_purpose::STANDARD.encode(hb)));
     let http_basic = &*Box::leak(Box::new(http_basic));
     let no_httpauth = args.no_httpauth == 1;
+    let idle_timeout = args.idle_timeout;
 
     let listener = TcpListener::bind(addr).await?;
     info!("HTTP Proxy listening on http://{}", addr);
@@ -216,6 +221,7 @@ async fn main() -> Result<()> {
                                 &http_basic,
                                 allowed_domains,
                                 no_httpauth,
+                                idle_timeout,
                             )
                         });
 
@@ -264,6 +270,7 @@ async fn proxy(
     http_basic: &Option<String>,
     allowed_domains: &Option<Vec<String>>,
     no_httpauth: bool,
+    idle_timeout: u64,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let mut http_authed = false;
     let hm = req.headers();
@@ -319,14 +326,19 @@ async fn proxy(
 
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
-            tokio::task::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        if let Err(e) = tunnel(upgraded, addr, socks_addr, auth).await {
-                            warn!("server io error: {}", e);
-                        };
+            tokio::task::spawn({
+                let idle_timeout = idle_timeout;
+                async move {
+                    match hyper::upgrade::on(req).await {
+                        Ok(upgraded) => {
+                            if let Err(e) =
+                                tunnel(upgraded, addr, socks_addr, auth, idle_timeout).await
+                            {
+                                warn!("server io error: {}", e);
+                            };
+                        }
+                        Err(e) => warn!("upgrade error: {}", e),
                     }
-                    Err(e) => warn!("upgrade error: {}", e),
                 }
             });
 
@@ -474,6 +486,7 @@ async fn tunnel(
     addr: String,
     socks_addr: SocketAddr,
     auth: &Option<Auth>,
+    idle_timeout: u64,
 ) -> Result<()> {
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     info!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
@@ -510,58 +523,54 @@ async fn tunnel(
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
 
-    // Critical fix: Add timeout to tunnel to prevent hanging
-    info!("Tunnel #{} starting bidirectional copy", conn_id);
-    let copy_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(540), // 9-minute timeout, longer than danted's 500s
-        tokio::io::copy_bidirectional(&mut client, &mut server),
-    )
-    .await;
+    let mut client_buf = [0u8; 8192];
+    let mut server_buf = [0u8; 8192];
+    let mut from_client: u64 = 0;
+    let mut from_server: u64 = 0;
+    let timeout = tokio::time::Duration::from_secs(idle_timeout);
 
-    // Critical fix: Always shutdown both ends regardless of copy result
-    let server_shutdown = async {
-        if let Err(e) = server.shutdown().await {
-            debug!(
-                "Server shutdown error (normal if danted closed first): {}",
-                e
-            );
+    loop {
+        let idle = tokio::time::sleep(timeout);
+        tokio::pin!(idle);
+
+        tokio::select! {
+            res = client.read(&mut client_buf) => {
+                let n = res?;
+                if n == 0 { break; }
+                server.write_all(&client_buf[..n]).await?;
+                from_client += n as u64;
+            }
+            res = server.read(&mut server_buf) => {
+                let n = res?;
+                if n == 0 { break; }
+                client.write_all(&server_buf[..n]).await?;
+                from_server += n as u64;
+            }
+            _ = &mut idle => {
+                info!("Tunnel #{} idle for {:?}, closing", conn_id, timeout);
+                break;
+            }
         }
-    };
+    }
 
-    let client_shutdown = async {
-        if let Err(e) = client.shutdown().await {
-            debug!("Client shutdown error: {}", e);
-        }
-    };
+    if let Err(e) = server.shutdown().await {
+        debug!(
+            "Server shutdown error (normal if danted closed first): {}",
+            e
+        );
+    }
+    if let Err(e) = client.shutdown().await {
+        debug!("Client shutdown error: {}", e);
+    }
 
-    tokio::join!(server_shutdown, client_shutdown);
-
-    // Force resource cleanup
     drop(server);
     drop(client);
 
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-
-    match copy_result {
-        Ok(Ok((from_client, from_server))) => {
-            info!(
-                "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
-                conn_id, from_client, from_server, remaining
-            );
-        }
-        Ok(Err(e)) => {
-            info!(
-                "Tunnel #{} ended with error: {}, {} active",
-                conn_id, e, remaining
-            );
-        }
-        Err(_) => {
-            error!(
-                "Tunnel #{} TIMED OUT after 9 minutes (danted should timeout at 500s), {} active",
-                conn_id, remaining
-            );
-        }
-    }
+    info!(
+        "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+        conn_id, from_client, from_server, remaining
+    );
 
     Ok(())
 }

@@ -43,6 +43,7 @@ Options:
       --no-httpauth <1/0>                  Ignore HTTP Basic Auth, [default: 1]
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
       --allowed-domains <ALLOWED_DOMAINS>  Comma-separated list of allowed domains
+      --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for tunnel connections [default: 540]
   -h, --help                               Print help information
   -V, --version                            Print version information
 ```
