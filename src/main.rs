@@ -428,7 +428,7 @@ async fn proxy(
                         conn_id, remaining
                     );
                     error!(
-                        "🚨 HTTP #{} connection timed out after 30s, forcing shutdown",
+                        "HTTP #{} connection timed out after 30s, forcing shutdown",
                         conn_id
                     );
                     if let Some(conn) = conn.take() {
