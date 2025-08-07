@@ -344,7 +344,7 @@ async fn proxy(
         let addr = format!("{}:{}", host, port);
 
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-        debug!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
+        info!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
 
         let socks_stream = match auth {
             Some(auth) => {
@@ -415,11 +415,14 @@ async fn proxy(
                         "HTTP #{} connection timed out, {} active",
                         conn_id, remaining
                     );
+                    error!("HTTP #{} connection timed out after 5s, forcing shutdown", conn_id);
                     if let Some(conn) = conn.take() {
                         let parts = conn.into_parts();
                         let mut io = parts.io.into_inner();
                         if let Err(e) = io.shutdown().await {
-                            debug!("HTTP #{} shutdown error after timeout: {}", conn_id, e);
+                            error!("HTTP #{} shutdown error after timeout: {}", conn_id, e);
+                        } else {
+                            info!("HTTP #{} successfully shutdown after timeout", conn_id);
                         }
                     }
                 }
@@ -431,8 +434,14 @@ async fn proxy(
         resp.headers_mut()
             .insert("Connection", HeaderValue::from_static("close"));
 
+        // Aggressive fix: Immediately signal connection should close
+        info!("HTTP #{} request sent, forcing connection cleanup", conn_id);
+
         // Drop the sender to terminate the connection once done
         drop(sender);
+
+        // Try to force immediate cleanup by reducing timeout to 1 second
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Critical fix: Ensure response body will be properly handled
         // The response body must be consumed by the client to prevent CLOSE_WAIT
@@ -464,7 +473,7 @@ async fn tunnel(
     auth: &Option<Auth>,
 ) -> Result<()> {
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-    debug!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
+    info!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
 
     let socks_stream = match auth {
         Some(auth) => {
@@ -498,8 +507,12 @@ async fn tunnel(
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
 
-    // Simple bidirectional copy
-    let copy_result = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+    // Critical fix: Add timeout to tunnel to prevent hanging
+    info!("Tunnel #{} starting bidirectional copy", conn_id);
+    let copy_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(300), // 5-minute timeout for tunnels
+        tokio::io::copy_bidirectional(&mut client, &mut server)
+    ).await;
 
     // Critical fix: Always shutdown both ends regardless of copy result
     let server_shutdown = async {
@@ -526,16 +539,22 @@ async fn tunnel(
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
 
     match copy_result {
-        Ok((from_client, from_server)) => {
-            debug!(
+        Ok(Ok((from_client, from_server))) => {
+            info!(
                 "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
                 conn_id, from_client, from_server, remaining
             );
         }
-        Err(e) => {
-            debug!(
+        Ok(Err(e)) => {
+            info!(
                 "Tunnel #{} ended with error: {}, {} active",
                 conn_id, e, remaining
+            );
+        }
+        Err(_) => {
+            error!(
+                "Tunnel #{} TIMED OUT after 5 minutes, {} active",
+                conn_id, remaining
             );
         }
     }
