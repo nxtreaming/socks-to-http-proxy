@@ -391,10 +391,10 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Drive the HTTP connection with a timeout and proper shutdown
+        // Critical fix: Match danted's 500s timeout + 20s buffer
         tokio::task::spawn(async move {
             let mut conn = Some(conn);
-            let result = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+            let result = tokio::time::timeout(tokio::time::Duration::from_secs(520), async {
                 conn.as_mut().unwrap().await
             })
             .await;
@@ -402,12 +402,12 @@ async fn proxy(
             let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
 
             match result {
-                Ok(Ok(_)) => debug!(
-                    "HTTP #{} connection completed, {} active",
+                Ok(Ok(_)) => info!(
+                    "HTTP #{} connection completed normally, {} active",
                     conn_id, remaining
                 ),
-                Ok(Err(e)) => debug!(
-                    "HTTP #{} connection ended: {}, {} active",
+                Ok(Err(e)) => info!(
+                    "HTTP #{} connection ended (likely danted timeout): {}, {} active",
                     conn_id, e, remaining
                 ),
                 Err(_) => {
@@ -416,7 +416,7 @@ async fn proxy(
                         conn_id, remaining
                     );
                     error!(
-                        "HTTP #{} connection timed out after 30s, forcing shutdown",
+                        "HTTP #{} connection timed out after 520s (danted should timeout at 500s), forcing shutdown",
                         conn_id
                     );
                     if let Some(conn) = conn.take() {
