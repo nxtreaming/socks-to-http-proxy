@@ -142,14 +142,14 @@ async fn main() -> Result<()> {
 
             // Alert logic
             match close_wait_count {
-                0..=10 => {
+                0..=100 => {
                     consecutive_high_count = 0;
                 }
-                11..=100 => {
+                101..=300 => {
                     warn!("Moderate CLOSE_WAIT leak: {} connections", close_wait_count);
                     consecutive_high_count = 0;
                 }
-                101..=500 => {
+                301..=600 => {
                     warn!("High CLOSE_WAIT leak: {} connections", close_wait_count);
                     consecutive_high_count += 1;
                 }
