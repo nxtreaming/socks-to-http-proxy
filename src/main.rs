@@ -391,10 +391,10 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Critical fix: Match danted's 500s timeout + 20s buffer
+        // Drive the HTTP connection with a timeout and proper shutdown
         tokio::task::spawn(async move {
             let mut conn = Some(conn);
-            let result = tokio::time::timeout(tokio::time::Duration::from_secs(520), async {
+            let result = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
                 conn.as_mut().unwrap().await
             })
             .await;
@@ -407,7 +407,7 @@ async fn proxy(
                     conn_id, remaining
                 ),
                 Ok(Err(e)) => info!(
-                    "HTTP #{} connection ended (likely danted timeout): {}, {} active",
+                    "HTTP #{} connection ended: {}, {} active",
                     conn_id, e, remaining
                 ),
                 Err(_) => {
@@ -416,7 +416,7 @@ async fn proxy(
                         conn_id, remaining
                     );
                     error!(
-                        "HTTP #{} connection timed out after 520s (danted should timeout at 500s), forcing shutdown",
+                        "🚨 HTTP #{} connection timed out after 30s, forcing shutdown",
                         conn_id
                     );
                     if let Some(conn) = conn.take() {
@@ -513,7 +513,7 @@ async fn tunnel(
     // Critical fix: Add timeout to tunnel to prevent hanging
     info!("Tunnel #{} starting bidirectional copy", conn_id);
     let copy_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(300), // 5-minute timeout for tunnels
+        tokio::time::Duration::from_secs(540), // 9-minute timeout, longer than danted's 500s
         tokio::io::copy_bidirectional(&mut client, &mut server),
     )
     .await;
@@ -557,7 +557,7 @@ async fn tunnel(
         }
         Err(_) => {
             error!(
-                "Tunnel #{} TIMED OUT after 5 minutes, {} active",
+                "Tunnel #{} TIMED OUT after 9 minutes (danted should timeout at 500s), {} active",
                 conn_id, remaining
             );
         }
