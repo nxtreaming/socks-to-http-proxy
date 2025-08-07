@@ -415,7 +415,10 @@ async fn proxy(
                         "HTTP #{} connection timed out, {} active",
                         conn_id, remaining
                     );
-                    error!("HTTP #{} connection timed out after 5s, forcing shutdown", conn_id);
+                    error!(
+                        "HTTP #{} connection timed out after 5s, forcing shutdown",
+                        conn_id
+                    );
                     if let Some(conn) = conn.take() {
                         let parts = conn.into_parts();
                         let mut io = parts.io.into_inner();
@@ -511,8 +514,9 @@ async fn tunnel(
     info!("Tunnel #{} starting bidirectional copy", conn_id);
     let copy_result = tokio::time::timeout(
         tokio::time::Duration::from_secs(300), // 5-minute timeout for tunnels
-        tokio::io::copy_bidirectional(&mut client, &mut server)
-    ).await;
+        tokio::io::copy_bidirectional(&mut client, &mut server),
+    )
+    .await;
 
     // Critical fix: Always shutdown both ends regardless of copy result
     let server_shutdown = async {
