@@ -428,6 +428,11 @@ async fn proxy(
 
         // Send the request
         let resp = sender.send_request(req).await?;
+
+        // Ensure proper connection cleanup to prevent CLOSE_WAIT connections
+        // Drop the sender to signal connection close
+        drop(sender);
+
         Ok(resp.map(|b| b.boxed()))
     }
 }
