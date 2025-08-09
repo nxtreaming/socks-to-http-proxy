@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -523,35 +523,28 @@ async fn tunnel(
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
 
-    let mut client_buf = [0u8; 8192];
-    let mut server_buf = [0u8; 8192];
-    let mut from_client: u64 = 0;
-    let mut from_server: u64 = 0;
+    // Performance fix: Use high-performance copy_bidirectional with timeout
     let timeout = tokio::time::Duration::from_secs(idle_timeout);
 
-    loop {
-        let idle = tokio::time::sleep(timeout);
-        tokio::pin!(idle);
+    let copy_result = tokio::time::timeout(
+        timeout,
+        tokio::io::copy_bidirectional(&mut client, &mut server)
+    ).await;
 
-        tokio::select! {
-            res = client.read(&mut client_buf) => {
-                let n = res?;
-                if n == 0 { break; }
-                server.write_all(&client_buf[..n]).await?;
-                from_client += n as u64;
-            }
-            res = server.read(&mut server_buf) => {
-                let n = res?;
-                if n == 0 { break; }
-                client.write_all(&server_buf[..n]).await?;
-                from_server += n as u64;
-            }
-            _ = &mut idle => {
-                info!("Tunnel #{} idle for {:?}, closing", conn_id, timeout);
-                break;
-            }
+    let (from_client, from_server) = match copy_result {
+        Ok(Ok((c, s))) => {
+            info!("Tunnel #{} completed normally: {}↑ {}↓ bytes", conn_id, c, s);
+            (c, s)
         }
-    }
+        Ok(Err(e)) => {
+            info!("Tunnel #{} ended with error: {}", conn_id, e);
+            (0, 0)
+        }
+        Err(_) => {
+            info!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
+            (0, 0)
+        }
+    };
 
     if let Err(e) = server.shutdown().await {
         debug!(
