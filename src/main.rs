@@ -8,6 +8,7 @@ use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -92,7 +93,8 @@ async fn main() -> Result<()> {
         .map(|auth| Auth::new(auth.username, auth.password));
     let auth = Arc::new(auth);
     let addr = SocketAddr::from((args.listen_ip, port));
-    let allowed_domains = args.allowed_domains;
+    let allowed_domains: Option<HashSet<String>> =
+        args.allowed_domains.map(|v| v.into_iter().collect());
     let allowed_domains = Arc::new(allowed_domains);
     let http_basic = args
         .http_basic
@@ -273,7 +275,7 @@ async fn proxy(
     socks_addr: SocketAddr,
     auth: Arc<Option<Auth>>,
     http_basic: Arc<Option<HeaderValue>>,
-    allowed_domains: Arc<Option<Vec<String>>>,
+    allowed_domains: Arc<Option<HashSet<String>>>,
     no_httpauth: bool,
     idle_timeout: u64,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
