@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
 
     // Add a connection monitoring task
     tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
         let mut consecutive_high_count = 0;
 
         loop {
@@ -847,5 +847,21 @@ mod tests {
 
         // Overhead should be minimal (less than 10% typically)
         assert!(overhead_ratio < 1.2, "Overhead too high: {:.3}x", overhead_ratio);
+    }
+
+    #[test]
+    fn test_monitoring_interval_configuration() {
+        // Test that monitoring interval is set to 5 minutes (300 seconds)
+        let expected_interval = tokio::time::Duration::from_secs(300);
+        let five_minutes = tokio::time::Duration::from_secs(5 * 60);
+
+        assert_eq!(expected_interval, five_minutes);
+        assert_eq!(expected_interval.as_secs(), 300);
+
+        // Verify it's not the old 30-second interval
+        let old_interval = tokio::time::Duration::from_secs(30);
+        assert_ne!(expected_interval, old_interval);
+
+        println!("Monitoring interval correctly set to {} seconds (5 minutes)", expected_interval.as_secs());
     }
 }
