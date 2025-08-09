@@ -10,12 +10,10 @@ use tracing_subscriber::EnvFilter;
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -502,88 +500,11 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
-struct ActivityIo<T> {
-    inner: T,
-    last_activity: Arc<AtomicU64>,
-    start: Instant,
-}
 
-impl<T> ActivityIo<T> {
-    fn new(inner: T, last_activity: Arc<AtomicU64>, start: Instant) -> Self {
-        Self {
-            inner,
-            last_activity,
-            start,
-        }
-    }
 
-    fn update(&self) {
-        let elapsed = self.start.elapsed().as_secs();
-        // Avoid unnecessary atomic writes if value hasn't advanced
-        let prev = self.last_activity.load(Ordering::Relaxed);
-        if elapsed != prev {
-            self.last_activity.store(elapsed, Ordering::Relaxed);
-        }
-    }
-}
 
-impl<T: Unpin> Unpin for ActivityIo<T> {}
 
-impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let inner = Pin::new(&mut this.inner);
-        match inner.poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                if !buf.filled().is_empty() {
-                    this.update();
-                }
-                Poll::Ready(Ok(()))
-            }
-            other => other,
-        }
-    }
-}
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let this = self.get_mut();
-        let inner = Pin::new(&mut this.inner);
-        match inner.poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => {
-                if n > 0 {
-                    this.update();
-                }
-                Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_shutdown(cx)
-    }
-}
 
 async fn tunnel(
     upgraded: Upgraded,
@@ -803,101 +724,11 @@ mod tests {
         assert!(hashset_duration < vec_duration);
     }
 
-    #[tokio::test]
-    async fn test_activity_io_wrapper() {
-        use tokio::time::Instant;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
 
-        let start = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
 
-        // Create a simple test buffer
-        let test_data = b"test data";
-        let cursor = std::io::Cursor::new(test_data.to_vec());
 
-        let mut activity_io = ActivityIo::new(cursor, last_activity.clone(), start);
 
-        // Test that activity is tracked
-        let initial_activity = last_activity.load(Ordering::Relaxed);
 
-        // Simulate some time passing
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Read some data to trigger activity update
-        let mut buf = [0u8; 4];
-        let _ = tokio::io::AsyncReadExt::read(&mut activity_io, &mut buf).await;
-
-        let updated_activity = last_activity.load(Ordering::Relaxed);
-
-        // Activity should have been updated (though might be same if very fast)
-        assert!(updated_activity >= initial_activity);
-    }
-
-    #[test]
-    fn test_activity_io_update_mechanism() {
-        use tokio::time::Instant;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-
-        let start = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-
-        let test_data = b"test";
-        let cursor = std::io::Cursor::new(test_data.to_vec());
-        let activity_io = ActivityIo::new(cursor, last_activity.clone(), start);
-
-        // Test the update mechanism
-        activity_io.update();
-
-        let activity_time = last_activity.load(Ordering::Relaxed);
-        // Activity time should be recorded (u64 is always >= 0, but this documents the expectation)
-        assert!(activity_time < u64::MAX);
-    }
-
-    #[tokio::test]
-    async fn test_activity_io_performance_overhead() {
-        use tokio::time::Instant;
-        use std::sync::atomic::AtomicU64;
-        use std::sync::Arc;
-
-        let test_data = vec![0u8; 1024 * 1024]; // 1MB test data
-        let iterations = 1000;
-
-        // Test raw I/O performance
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let mut cursor = std::io::Cursor::new(test_data.clone());
-            let mut buf = vec![0u8; 1024];
-            while tokio::io::AsyncReadExt::read(&mut cursor, &mut buf).await.unwrap() > 0 {
-                // Simulate reading
-            }
-        }
-        let raw_duration = start.elapsed();
-
-        // Test ActivityIo wrapped performance
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let cursor = std::io::Cursor::new(test_data.clone());
-            let mut activity_cursor = ActivityIo::new(cursor, last_activity.clone(), start_time);
-            let mut buf = vec![0u8; 1024];
-            while tokio::io::AsyncReadExt::read(&mut activity_cursor, &mut buf).await.unwrap() > 0 {
-                // Simulate reading with activity tracking
-            }
-        }
-        let wrapped_duration = start.elapsed();
-
-        println!("Raw I/O: {:?}", raw_duration);
-        println!("ActivityIo: {:?}", wrapped_duration);
-
-        let overhead_ratio = wrapped_duration.as_nanos() as f64 / raw_duration.as_nanos() as f64;
-        println!("Overhead ratio: {:.3}x", overhead_ratio);
-
-        // Overhead should be minimal (less than 10% typically)
-        assert!(overhead_ratio < 1.2, "Overhead too high: {:.3}x", overhead_ratio);
-    }
 
     #[test]
     fn test_monitoring_interval_configuration() {
