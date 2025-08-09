@@ -390,10 +390,7 @@ async fn proxy(
             },
         };
 
-        // Critical fix: Force Connection: close to prevent keep-alive
-        let mut req = req;
-        req.headers_mut()
-            .insert("connection", HeaderValue::from_static("close"));
+        // Allow HTTP keep-alive for better performance
 
         let io = TokioIo::new(socks_stream);
 
@@ -403,64 +400,17 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Drive the HTTP connection with a timeout and proper shutdown
+        // Simple connection handling for better performance
         tokio::task::spawn(async move {
-            let mut conn = Some(conn);
-            let result = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
-                conn.as_mut().unwrap().await
-            })
-            .await;
-
-            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-
-            match result {
-                Ok(Ok(_)) => info!(
-                    "HTTP #{} connection completed normally, {} active",
-                    conn_id, remaining
-                ),
-                Ok(Err(e)) => info!(
-                    "HTTP #{} connection ended: {}, {} active",
-                    conn_id, e, remaining
-                ),
-                Err(_) => {
-                    debug!(
-                        "HTTP #{} connection timed out, {} active",
-                        conn_id, remaining
-                    );
-                    error!(
-                        "HTTP #{} connection timed out after 30s, forcing shutdown",
-                        conn_id
-                    );
-                    if let Some(conn) = conn.take() {
-                        let parts = conn.into_parts();
-                        let mut io = parts.io.into_inner();
-                        if let Err(e) = io.shutdown().await {
-                            error!("HTTP #{} shutdown error after timeout: {}", conn_id, e);
-                        } else {
-                            info!("HTTP #{} successfully shutdown after timeout", conn_id);
-                        }
-                    }
-                }
+            if let Err(err) = conn.await {
+                debug!("HTTP #{} connection ended: {:?}", conn_id, err);
             }
+            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
         });
 
-        // Send the request with Connection: close header
-        let mut resp = sender.send_request(req).await?;
-        resp.headers_mut()
-            .insert("Connection", HeaderValue::from_static("close"));
-
-        // Aggressive fix: Immediately signal connection should close
-        info!("HTTP #{} request sent, forcing connection cleanup", conn_id);
-
-        // Drop the sender to terminate the connection once done
-        drop(sender);
-
-        // Try to force immediate cleanup by reducing timeout to 1 second
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Critical fix: Ensure response body will be properly handled
-        // The response body must be consumed by the client to prevent CLOSE_WAIT
-        // We return the response as-is, but the HTTP framework will handle consumption
+        // Send the request
+        let resp = sender.send_request(req).await?;
         Ok(resp.map(|b| b.boxed()))
     }
 }
