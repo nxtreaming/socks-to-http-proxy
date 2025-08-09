@@ -111,7 +111,8 @@ async fn main() -> Result<()> {
     info!("HTTP Proxy listening on http://{}", addr);
     info!("SOCKS5 backend: {}", socks_addr);
 
-    // Add a connection monitoring task
+    // Add a connection monitoring task (only on Unix to avoid shell overhead on Windows)
+    #[cfg(unix)]
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
         let mut consecutive_high_count = 0;
@@ -236,8 +237,6 @@ async fn main() -> Result<()> {
                         });
 
                         if let Err(err) = http1::Builder::new()
-                            .preserve_header_case(true)
-                            .title_case_headers(true)
                             .serve_connection(io, service)
                             .with_upgrades()
                             .await
@@ -289,7 +288,7 @@ async fn proxy(
         let headers = req.headers();
 
         // Early return if no authorization header
-        let auth_header = match headers.get("proxy-authorization") {
+        let auth_header = match headers.get(hyper::header::PROXY_AUTHORIZATION) {
             Some(header) => header,
             None => {
                 // When the request does not contain a Proxy-Authorization header,
@@ -376,7 +375,7 @@ async fn proxy(
         let addr = format!("{}:{}", host, port);
 
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-        info!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
+        debug!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
 
         let socks_stream = match auth.as_ref() {
             Some(auth) => {
@@ -415,8 +414,6 @@ async fn proxy(
         let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
-            .preserve_header_case(true)
-            .title_case_headers(true)
             .handshake(io)
             .await?;
 
@@ -468,7 +465,11 @@ impl<T> ActivityIo<T> {
 
     fn update(&self) {
         let elapsed = self.start.elapsed().as_secs();
-        self.last_activity.store(elapsed, Ordering::Relaxed);
+        // Avoid unnecessary atomic writes if value hasn't advanced
+        let prev = self.last_activity.load(Ordering::Relaxed);
+        if elapsed != prev {
+            self.last_activity.store(elapsed, Ordering::Relaxed);
+        }
     }
 }
 
@@ -538,7 +539,7 @@ async fn tunnel(
     idle_timeout: u64,
 ) -> Result<()> {
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-    info!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
+    debug!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
 
     let socks_stream = match auth.as_ref() {
         Some(auth) => {
@@ -607,7 +608,7 @@ async fn tunnel(
     let (from_client, from_server) = match result.0 {
         Some(res) => res?,
         None => {
-            info!(
+            debug!(
                 "Tunnel #{} idle timeout after {:?}, closing",
                 conn_id,
                 tokio::time::Duration::from_secs(idle_timeout)
@@ -616,7 +617,7 @@ async fn tunnel(
         }
     };
 
-    info!(
+    debug!(
         "Tunnel #{} completed: {}↑ {}↓ bytes",
         conn_id, from_client, from_server
     );
@@ -635,7 +636,7 @@ async fn tunnel(
     drop(client);
 
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-    info!(
+    debug!(
         "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
         conn_id, from_client, from_server, remaining
     );
