@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 
@@ -89,15 +90,15 @@ async fn main() -> Result<()> {
     let auth = args
         .auth
         .map(|auth| Auth::new(auth.username, auth.password));
-    let auth = &*Box::leak(Box::new(auth));
+    let auth = Arc::new(auth);
     let addr = SocketAddr::from((args.listen_ip, port));
     let allowed_domains = args.allowed_domains;
-    let allowed_domains = &*Box::leak(Box::new(allowed_domains));
+    let allowed_domains = Arc::new(allowed_domains);
     let http_basic = args
         .http_basic
         .map(|hb| format!("Basic {}", general_purpose::STANDARD.encode(hb)))
         .map(|auth_str| HeaderValue::from_str(&auth_str).expect("Invalid HTTP Basic auth string"));
-    let http_basic = &*Box::leak(Box::new(http_basic));
+    let http_basic = Arc::new(http_basic);
     let no_httpauth = args.no_httpauth == 1;
     let idle_timeout = args.idle_timeout;
 
@@ -212,15 +213,18 @@ async fn main() -> Result<()> {
                 Ok((stream, peer_addr)) => {
                     debug!("New connection from {}", peer_addr);
 
+                    let auth = auth.clone();
+                    let http_basic = http_basic.clone();
+                    let allowed_domains = allowed_domains.clone();
                     tokio::task::spawn(async move {
                         let io = TokioIo::new(stream);
                         let service = service_fn(move |req| {
                             proxy(
                                 req,
                                 socks_addr,
-                                auth,
-                                &http_basic,
-                                allowed_domains,
+                                auth.clone(),
+                                http_basic.clone(),
+                                allowed_domains.clone(),
                                 no_httpauth,
                                 idle_timeout,
                             )
@@ -267,9 +271,9 @@ async fn main() -> Result<()> {
 async fn proxy(
     req: Request<hyper::body::Incoming>,
     socks_addr: SocketAddr,
-    auth: &'static Option<Auth>,
-    http_basic: &Option<HeaderValue>,
-    allowed_domains: &Option<Vec<String>>,
+    auth: Arc<Option<Auth>>,
+    http_basic: Arc<Option<HeaderValue>>,
+    allowed_domains: Arc<Option<Vec<String>>>,
     no_httpauth: bool,
     idle_timeout: u64,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
@@ -296,7 +300,7 @@ async fn proxy(
         };
 
         // Early return for authentication failure
-        match http_basic {
+        match http_basic.as_ref() {
             Some(expected_auth) => {
                 if auth_header != expected_auth {
                     warn!("Failed to authenticate: {:?}", headers);
@@ -320,7 +324,9 @@ async fn proxy(
 
     let method = req.method();
     debug!("Proxying request: {} {}", method, req.uri());
-    if let (Some(allowed_domains), Some(request_domain)) = (allowed_domains, req.uri().host()) {
+    if let (Some(allowed_domains), Some(request_domain)) =
+        (allowed_domains.as_ref(), req.uri().host())
+    {
         let domain = request_domain.to_owned();
         if !allowed_domains.contains(&domain) {
             warn!(
@@ -337,20 +343,17 @@ async fn proxy(
 
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
-            tokio::task::spawn({
-
-                async move {
-                    match hyper::upgrade::on(req).await {
-                        Ok(upgraded) => {
-                            let idle_timeout = idle_timeout;
-                            if let Err(e) =
-                                tunnel(upgraded, addr, socks_addr, auth, idle_timeout).await
-                            {
-                                warn!("server io error: {}", e);
-                            };
-                        }
-                        Err(e) => warn!("upgrade error: {}", e),
+            let auth = auth.clone();
+            tokio::task::spawn(async move {
+                match hyper::upgrade::on(req).await {
+                    Ok(upgraded) => {
+                        let idle_timeout = idle_timeout;
+                        if let Err(e) = tunnel(upgraded, addr, socks_addr, auth, idle_timeout).await
+                        {
+                            warn!("server io error: {}", e);
+                        };
                     }
+                    Err(e) => warn!("upgrade error: {}", e),
                 }
             });
 
@@ -370,7 +373,7 @@ async fn proxy(
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         info!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
 
-        let socks_stream = match auth {
+        let socks_stream = match auth.as_ref() {
             Some(auth) => {
                 match Socks5Stream::connect_with_password(
                     socks_addr,
@@ -447,13 +450,13 @@ async fn tunnel(
     upgraded: Upgraded,
     addr: String,
     socks_addr: SocketAddr,
-    auth: &Option<Auth>,
+    auth: Arc<Option<Auth>>,
     idle_timeout: u64,
 ) -> Result<()> {
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     info!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
 
-    let socks_stream = match auth {
+    let socks_stream = match auth.as_ref() {
         Some(auth) => {
             match Socks5Stream::connect_with_password(
                 socks_addr,
@@ -518,7 +521,10 @@ async fn tunnel(
         }
     }
 
-    info!("Tunnel #{} completed: {}↑ {}↓ bytes", conn_id, from_client, from_server);
+    info!(
+        "Tunnel #{} completed: {}↑ {}↓ bytes",
+        conn_id, from_client, from_server
+    );
 
     if let Err(e) = server.shutdown().await {
         debug!(
