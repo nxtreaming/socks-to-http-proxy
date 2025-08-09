@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -327,10 +327,11 @@ async fn proxy(
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
             tokio::task::spawn({
-                let idle_timeout = idle_timeout;
+
                 async move {
                     match hyper::upgrade::on(req).await {
                         Ok(upgraded) => {
+                            let idle_timeout = idle_timeout;
                             if let Err(e) =
                                 tunnel(upgraded, addr, socks_addr, auth, idle_timeout).await
                             {
@@ -390,7 +391,7 @@ async fn proxy(
             },
         };
 
-        // Allow HTTP keep-alive for better performance
+        // Allow HTTP to keep alive for better performance
 
         let io = TokioIo::new(socks_stream);
 
@@ -473,28 +474,40 @@ async fn tunnel(
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
 
-    // Performance fix: Use high-performance copy_bidirectional with timeout
+    // Idle-aware bidirectional copy with optimized performance
     let timeout = tokio::time::Duration::from_secs(idle_timeout);
+    let mut from_client = 0u64;
+    let mut from_server = 0u64;
 
-    let copy_result = tokio::time::timeout(
-        timeout,
-        tokio::io::copy_bidirectional(&mut client, &mut server)
-    ).await;
+    // Use larger buffers for better performance
+    let mut client_buf = vec![0u8; 32768]; // 32KB buffer
+    let mut server_buf = vec![0u8; 32768]; // 32KB buffer
 
-    let (from_client, from_server) = match copy_result {
-        Ok(Ok((c, s))) => {
-            info!("Tunnel #{} completed normally: {}↑ {}↓ bytes", conn_id, c, s);
-            (c, s)
+    loop {
+        let idle = tokio::time::sleep(timeout);
+        tokio::pin!(idle);
+
+        tokio::select! {
+            res = client.read(&mut client_buf) => {
+                let n = res?;
+                if n == 0 { break; }
+                server.write_all(&client_buf[..n]).await?;
+                from_client += n as u64;
+            }
+            res = server.read(&mut server_buf) => {
+                let n = res?;
+                if n == 0 { break; }
+                client.write_all(&server_buf[..n]).await?;
+                from_server += n as u64;
+            }
+            _ = &mut idle => {
+                info!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
+                break;
+            }
         }
-        Ok(Err(e)) => {
-            info!("Tunnel #{} ended with error: {}", conn_id, e);
-            (0, 0)
-        }
-        Err(_) => {
-            info!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
-            (0, 0)
-        }
-    };
+    }
+
+    info!("Tunnel #{} completed: {}↑ {}↓ bytes", conn_id, from_client, from_server);
 
     if let Err(e) = server.shutdown().await {
         debug!(
