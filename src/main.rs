@@ -10,9 +10,12 @@ use tracing_subscriber::EnvFilter;
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::time::Instant;
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -448,6 +451,85 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
+struct ActivityIo<T> {
+    inner: T,
+    last_activity: Arc<AtomicU64>,
+    start: Instant,
+}
+
+impl<T> ActivityIo<T> {
+    fn new(inner: T, last_activity: Arc<AtomicU64>, start: Instant) -> Self {
+        Self {
+            inner,
+            last_activity,
+            start,
+        }
+    }
+
+    fn update(&self) {
+        let elapsed = self.start.elapsed().as_secs();
+        self.last_activity.store(elapsed, Ordering::Relaxed);
+    }
+}
+
+impl<T: Unpin> Unpin for ActivityIo<T> {}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let inner = Pin::new(&mut this.inner);
+        match inner.poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if !buf.filled().is_empty() {
+                    this.update();
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        let inner = Pin::new(&mut this.inner);
+        match inner.poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    this.update();
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 async fn tunnel(
     upgraded: Upgraded,
     addr: String,
@@ -487,41 +569,52 @@ async fn tunnel(
         },
     };
 
-    let mut client = TokioIo::new(upgraded);
-    let mut server = socks_stream;
+    let start = Instant::now();
+    let last_activity = Arc::new(AtomicU64::new(0));
+    let mut client = ActivityIo::new(TokioIo::new(upgraded), last_activity.clone(), start);
+    let mut server = ActivityIo::new(socks_stream, last_activity.clone(), start);
 
-    // Idle-aware bidirectional copy with optimized performance
-    let timeout = tokio::time::Duration::from_secs(idle_timeout);
-    let mut from_client = 0u64;
-    let mut from_server = 0u64;
-
-    // Use larger buffers for better performance
-    let mut client_buf = vec![0u8; 32768]; // 32KB buffer
-    let mut server_buf = vec![0u8; 32768]; // 32KB buffer
-
-    loop {
-        let idle = tokio::time::sleep(timeout);
-        tokio::pin!(idle);
-
-        tokio::select! {
-            res = client.read(&mut client_buf) => {
-                let n = res?;
-                if n == 0 { break; }
-                server.write_all(&client_buf[..n]).await?;
-                from_client += n as u64;
-            }
-            res = server.read(&mut server_buf) => {
-                let n = res?;
-                if n == 0 { break; }
-                client.write_all(&server_buf[..n]).await?;
-                from_server += n as u64;
-            }
-            _ = &mut idle => {
-                info!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
-                break;
+    let timeout = idle_timeout;
+    let mut watchdog = tokio::spawn({
+        let last = last_activity.clone();
+        let start = start;
+        async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let elapsed = start.elapsed().as_secs();
+                let last_seen = last.load(Ordering::Relaxed);
+                if elapsed.saturating_sub(last_seen) >= timeout {
+                    break;
+                }
             }
         }
+    });
+
+    let result = tokio::select! {
+        res = tokio::io::copy_bidirectional(&mut client, &mut server) => {
+            (Some(res), false)
+        }
+        _ = &mut watchdog => {
+            (None, true)
+        }
+    };
+
+    if !result.1 {
+        watchdog.abort();
     }
+
+    let (from_client, from_server) = match result.0 {
+        Some(res) => res?,
+        None => {
+            info!(
+                "Tunnel #{} idle timeout after {:?}, closing",
+                conn_id,
+                tokio::time::Duration::from_secs(idle_timeout)
+            );
+            (0, 0)
+        }
+    };
 
     info!(
         "Tunnel #{} completed: {}↑ {}↓ bytes",
