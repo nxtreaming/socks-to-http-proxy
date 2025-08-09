@@ -237,6 +237,8 @@ async fn main() -> Result<()> {
                         });
 
                         if let Err(err) = http1::Builder::new()
+                            .preserve_header_case(true)
+                            .title_case_headers(true)
                             .serve_connection(io, service)
                             .with_upgrades()
                             .await
@@ -414,6 +416,8 @@ async fn proxy(
         let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
             .handshake(io)
             .await?;
 
