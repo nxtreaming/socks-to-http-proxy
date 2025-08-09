@@ -698,4 +698,58 @@ mod tests {
         // The new approach should be significantly faster
         assert!(new_duration < old_duration);
     }
+
+    #[test]
+    fn test_hashset_domain_conversion() {
+        // Test Vec to HashSet conversion
+        let domains_vec = vec![
+            "example.com".to_string(),
+            "test.org".to_string(),
+            "allowed.net".to_string(),
+        ];
+
+        let domains_hashset: HashSet<String> = domains_vec.into_iter().collect();
+
+        assert!(domains_hashset.contains("example.com"));
+        assert!(domains_hashset.contains("test.org"));
+        assert!(domains_hashset.contains("allowed.net"));
+        assert!(!domains_hashset.contains("blocked.com"));
+        assert_eq!(domains_hashset.len(), 3);
+    }
+
+    #[test]
+    fn test_domain_lookup_performance() {
+        use std::time::Instant;
+
+        // Create test data
+        let domains: Vec<String> = (0..1000)
+            .map(|i| format!("domain{}.com", i))
+            .collect();
+
+        // Test Vec performance
+        let domains_vec = domains.clone();
+        let test_domain = "domain500.com";
+        let iterations = 10000;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _found = domains_vec.contains(&test_domain.to_string());
+        }
+        let vec_duration = start.elapsed();
+
+        // Test HashSet performance
+        let domains_hashset: HashSet<String> = domains.into_iter().collect();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _found = domains_hashset.contains(test_domain);
+        }
+        let hashset_duration = start.elapsed();
+
+        println!("Vec lookup: {:?}", vec_duration);
+        println!("HashSet lookup: {:?}", hashset_duration);
+
+        // HashSet should be significantly faster for large datasets
+        assert!(hashset_duration < vec_duration);
+    }
 }
