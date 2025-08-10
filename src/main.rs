@@ -594,8 +594,6 @@ mod tests {
         let _header_value = HeaderValue::from_str(&auth_string).expect("Valid header value");
     }
 
-
-
     #[test]
     fn test_hashset_domain_conversion() {
         // Test Vec to HashSet conversion
@@ -619,9 +617,7 @@ mod tests {
         use std::time::Instant;
 
         // Create test data
-        let domains: Vec<String> = (0..1000)
-            .map(|i| format!("domain{}.com", i))
-            .collect();
+        let domains: Vec<String> = (0..1000).map(|i| format!("domain{}.com", i)).collect();
 
         // Test Vec performance
         let domains_vec = domains.clone();
@@ -649,6 +645,4 @@ mod tests {
         // HashSet should be significantly faster for large datasets
         assert!(hashset_duration < vec_duration);
     }
-
-
 }
