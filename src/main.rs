@@ -552,12 +552,11 @@ async fn tunnel(
     let mut from_client = 0u64;
     let mut from_server = 0u64;
 
-    // Use optimized buffer sizes for 1Gbps network performance
     // Larger buffers for better throughput on high-speed networks
     let buffer_size = if idle_timeout > 300 {
-        65536 // 64KB for long-lived connections (better for large transfers)
+        32768 // 32KB for long-lived connections (better for large transfers)
     } else {
-        32768 // 32KB for short-lived connections (balance latency/throughput)
+        16384 // 16KB for short-lived connections (balance latency/throughput)
     };
     let mut client_buf = vec![0u8; buffer_size];
     let mut server_buf = vec![0u8; buffer_size];
