@@ -434,7 +434,8 @@ async fn proxy(
         // Send the request
         let resp = sender.send_request(req).await?;
 
-        // Critical fix: Drop sender to prevent CLOSE_WAIT connections
+        // Ensure immediate resource cleanup when client disconnects
+        // This prevents "zombie sessions" that waste backend connections
         drop(sender);
 
         // Critical fix: Ensure response body will be properly handled
