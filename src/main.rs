@@ -33,6 +33,11 @@ use tokio::net::TcpListener;
 // Global counter for tracking active SOCKS5 connections
 static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+// Connection pool limits for multi-instance deployment on 16GB server
+const MAX_CONCURRENT_CONNECTIONS: usize = 40000; // 40K concurent connection (~7.4GB per instance)
+const CONNECTION_BACKLOG_THRESHOLD: usize = 30000; // 30K warning threshold (~5.5GB)
+const MEMORY_PRESSURE_THRESHOLD: usize = 35000; // 35K memory threshold (~6.4GB)
+
 #[derive(Debug, Args)]
 #[group()]
 struct Auths {
@@ -139,11 +144,14 @@ async fn main() -> Result<()> {
 
             let active = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
-            if close_wait_count > 0 || active > 0 {
+            // Only log when there are issues or significant activity
+            if close_wait_count > 0 || active > 100 {
                 info!(
                     "SOCKS5 Status - Active: {}, CLOSE_WAIT: {}",
                     active, close_wait_count
                 );
+            } else if active > 0 {
+                debug!("SOCKS5 Status - Active: {}", active);
             }
 
             // Alert logic
@@ -374,8 +382,32 @@ async fn proxy(
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
+        // Check connection limits for stability
+        let current_connections = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+        if current_connections >= MAX_CONCURRENT_CONNECTIONS {
+            warn!("Connection limit reached: {}", current_connections);
+            let mut resp = Response::new(full("Server overloaded, please try again later"));
+            *resp.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+            return Ok(resp);
+        }
+
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         debug!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
+
+        // Multi-level warning system for high-capacity server
+        if current_connections > MEMORY_PRESSURE_THRESHOLD {
+            error!(
+                "Critical connection count: {} (memory pressure threshold: {})",
+                current_connections, MEMORY_PRESSURE_THRESHOLD
+            );
+        } else if current_connections > CONNECTION_BACKLOG_THRESHOLD {
+            warn!(
+                "High connection count: {} (threshold: {})",
+                current_connections, CONNECTION_BACKLOG_THRESHOLD
+            );
+        } else if current_connections > 20000 {
+            info!("Moderate connection load: {}", current_connections);
+        }
 
         let socks_stream = match auth.as_ref() {
             Some(auth) => {
@@ -409,7 +441,8 @@ async fn proxy(
             },
         };
 
-        // Critical fix: Force Connection: close to prevent keep-alive
+        // Force Connection: close for stability (prevents CLOSE_WAIT issues)
+        // This trades some performance for better connection management
         let mut req = req;
         req.headers_mut()
             .insert("connection", HeaderValue::from_static("close"));
@@ -468,6 +501,17 @@ async fn tunnel(
     auth: Arc<Option<Auth>>,
     idle_timeout: u64,
 ) -> Result<()> {
+    // Check connection limits for stability
+    let current_connections = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+    if current_connections >= MAX_CONCURRENT_CONNECTIONS {
+        warn!("Tunnel connection limit reached: {}", current_connections);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Server overloaded",
+        )
+        .into());
+    }
+
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     debug!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
 
@@ -508,9 +552,15 @@ async fn tunnel(
     let mut from_client = 0u64;
     let mut from_server = 0u64;
 
-    // Use larger buffers for better performance
-    let mut client_buf = vec![0u8; 32768]; // 32KB buffer
-    let mut server_buf = vec![0u8; 32768]; // 32KB buffer
+    // Use optimized buffer sizes for 1Gbps network performance
+    // Larger buffers for better throughput on high-speed networks
+    let buffer_size = if idle_timeout > 300 {
+        65536 // 64KB for long-lived connections (better for large transfers)
+    } else {
+        32768 // 32KB for short-lived connections (balance latency/throughput)
+    };
+    let mut client_buf = vec![0u8; buffer_size];
+    let mut server_buf = vec![0u8; buffer_size];
 
     loop {
         let idle = tokio::time::sleep(timeout);
@@ -561,10 +611,14 @@ async fn tunnel(
     drop(client);
 
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-    debug!(
-        "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
-        conn_id, from_client, from_server, remaining
-    );
+
+    // Only log detailed stats for significant transfers or when debugging
+    if from_client + from_server > 1024 || tracing::enabled!(tracing::Level::DEBUG) {
+        debug!(
+            "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+            conn_id, from_client, from_server, remaining
+        );
+    }
 
     Ok(())
 }
