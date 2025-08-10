@@ -422,60 +422,20 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Drive the HTTP connection with a timeout and proper shutdown
+        // Simple connection handling for better performance
         tokio::task::spawn(async move {
-            let mut conn = Some(conn);
-            let result = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
-                conn.as_mut().unwrap().await
-            })
-            .await;
-
-            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-
-            match result {
-                Ok(Ok(_)) => debug!(
-                    "HTTP #{} connection completed normally, {} active",
-                    conn_id, remaining
-                ),
-                Ok(Err(e)) => debug!(
-                    "HTTP #{} connection ended: {}, {} active",
-                    conn_id, e, remaining
-                ),
-                Err(_) => {
-                    debug!(
-                        "HTTP #{} connection timed out, {} active",
-                        conn_id, remaining
-                    );
-                    error!(
-                        "HTTP #{} connection timed out after 30s, forcing shutdown",
-                        conn_id
-                    );
-                    if let Some(conn) = conn.take() {
-                        let parts = conn.into_parts();
-                        let mut io = parts.io.into_inner();
-                        if let Err(e) = io.shutdown().await {
-                            error!("HTTP #{} shutdown error after timeout: {}", conn_id, e);
-                        } else {
-                            debug!("HTTP #{} successfully shutdown after timeout", conn_id);
-                        }
-                    }
-                }
+            if let Err(err) = conn.await {
+                debug!("HTTP #{} connection ended: {:?}", conn_id, err);
             }
+            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
         });
 
-        // Send the request with Connection: close header
-        let mut resp = sender.send_request(req).await?;
-        resp.headers_mut()
-            .insert("Connection", HeaderValue::from_static("close"));
+        // Send the request
+        let resp = sender.send_request(req).await?;
 
-        // Aggressive fix: Immediately signal connection should close
-        debug!("HTTP #{} request sent, forcing connection cleanup", conn_id);
-
-        // Drop the sender to terminate the connection once done
+        // Critical fix: Drop sender to prevent CLOSE_WAIT connections
         drop(sender);
-
-        // Try to force immediate cleanup by reducing timeout to 1 second
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Critical fix: Ensure response body will be properly handled
         // The response body must be consumed by the client to prevent CLOSE_WAIT
@@ -499,12 +459,6 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .map_err(|never| match never {})
         .boxed()
 }
-
-
-
-
-
-
 
 async fn tunnel(
     upgraded: Upgraded,
@@ -723,12 +677,6 @@ mod tests {
         // HashSet should be significantly faster for large datasets
         assert!(hashset_duration < vec_duration);
     }
-
-
-
-
-
-
 
     #[test]
     fn test_monitoring_interval_configuration() {
