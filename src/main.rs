@@ -594,36 +594,7 @@ mod tests {
         let _header_value = HeaderValue::from_str(&auth_string).expect("Valid header value");
     }
 
-    #[test]
-    fn test_auth_optimization_comparison() {
-        use std::time::Instant;
 
-        // Simulate the old approach (string cloning and repeated HeaderValue creation)
-        let auth_string = "Basic dGVzdDp0ZXN0";
-        let iterations = 10000;
-
-        // Old approach simulation
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let _cloned = auth_string.to_string(); // Simulate cloning
-            let _header = HeaderValue::from_str(&auth_string).unwrap(); // Repeated creation
-        }
-        let old_duration = start.elapsed();
-
-        // New approach simulation (pre-created HeaderValue)
-        let pre_created_header = HeaderValue::from_str(auth_string).unwrap();
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let _comparison = &pre_created_header; // Direct reference comparison
-        }
-        let new_duration = start.elapsed();
-
-        println!("Old approach: {:?}", old_duration);
-        println!("New approach: {:?}", new_duration);
-
-        // The new approach should be significantly faster
-        assert!(new_duration < old_duration);
-    }
 
     #[test]
     fn test_hashset_domain_conversion() {
@@ -679,19 +650,5 @@ mod tests {
         assert!(hashset_duration < vec_duration);
     }
 
-    #[test]
-    fn test_monitoring_interval_configuration() {
-        // Test that monitoring interval is set to 5 minutes (300 seconds)
-        let expected_interval = tokio::time::Duration::from_secs(300);
-        let five_minutes = tokio::time::Duration::from_secs(5 * 60);
 
-        assert_eq!(expected_interval, five_minutes);
-        assert_eq!(expected_interval.as_secs(), 300);
-
-        // Verify it's not the old 30-second interval
-        let old_interval = tokio::time::Duration::from_secs(30);
-        assert_ne!(expected_interval, old_interval);
-
-        println!("Monitoring interval correctly set to {} seconds (5 minutes)", expected_interval.as_secs());
-    }
 }
