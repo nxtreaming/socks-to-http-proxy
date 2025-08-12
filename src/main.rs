@@ -339,11 +339,10 @@ async fn proxy(
     if let (Some(allowed_domains), Some(request_domain)) =
         (allowed_domains.as_ref(), req.uri().host())
     {
-        let domain = request_domain.to_owned();
-        if !allowed_domains.contains(&domain) {
+        if !allowed_domains.contains(request_domain) {
             warn!(
                 "Access to domain {} is not allowed through the proxy.",
-                domain
+                request_domain
             );
             let mut resp = Response::new(full(
                 "Access to this domain is not allowed through the proxy.",
@@ -413,7 +412,7 @@ async fn proxy(
             Some(auth) => {
                 match Socks5Stream::connect_with_password(
                     socks_addr,
-                    addr.clone(),
+                    addr.as_str(),
                     &auth.username,
                     &auth.password,
                 )
@@ -429,7 +428,7 @@ async fn proxy(
                     }
                 }
             }
-            None => match Socks5Stream::connect(socks_addr, addr.clone()).await {
+            None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
@@ -519,7 +518,7 @@ async fn tunnel(
         Some(auth) => {
             match Socks5Stream::connect_with_password(
                 socks_addr,
-                addr.clone(),
+                addr.as_str(),
                 &auth.username,
                 &auth.password,
             )
@@ -535,7 +534,7 @@ async fn tunnel(
                 }
             }
         }
-        None => match Socks5Stream::connect(socks_addr, addr.clone()).await {
+        None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
             Ok(stream) => stream,
             Err(e) => {
                 ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
@@ -560,11 +559,10 @@ async fn tunnel(
     };
     let mut client_buf = vec![0u8; buffer_size];
     let mut server_buf = vec![0u8; buffer_size];
+    let idle = tokio::time::sleep(timeout);
+    tokio::pin!(idle);
 
     loop {
-        let idle = tokio::time::sleep(timeout);
-        tokio::pin!(idle);
-
         tokio::select! {
             res = client.read(&mut client_buf) => {
                 let n = res?;
@@ -574,6 +572,7 @@ async fn tunnel(
                 }
                 server.write_all(&client_buf[..n]).await?;
                 from_client += n as u64;
+                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             res = server.read(&mut server_buf) => {
                 let n = res?;
@@ -583,6 +582,7 @@ async fn tunnel(
                 }
                 client.write_all(&server_buf[..n]).await?;
                 from_server += n as u64;
+                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             _ = &mut idle => {
                 debug!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
