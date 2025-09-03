@@ -5,7 +5,7 @@ use clap::{value_parser, Args, Parser};
 use color_eyre::eyre::Result;
 
 use tokio_socks::tcp::Socks5Stream;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use std::collections::HashSet;
@@ -86,7 +86,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     color_eyre::install()?;
 
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
                     .parse::<u32>()
                     .unwrap_or(0),
                 Err(e) => {
-                    debug!("Failed to check CLOSE_WAIT: {}", e);
+                    warn!("Failed to check CLOSE_WAIT: {}", e);
                     0
                 }
             };
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
                     active, close_wait_count
                 );
             } else if active > 0 {
-                debug!("SOCKS5 Status - Active: {}", active);
+                // Removed debug log for active connections to reduce noise
             }
 
             // Alert logic
@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
-                    debug!("New connection from {}", peer_addr);
+                    // Removed debug log for new connections to reduce noise
 
                     let auth = auth.clone();
                     let http_basic = http_basic.clone();
@@ -249,7 +249,10 @@ async fn main() -> Result<()> {
                             .with_upgrades()
                             .await
                         {
-                            debug!("Connection from {} ended: {:?}", peer_addr, err);
+                            // Only log connection errors, not normal endings
+                            if !err.to_string().contains("connection closed") {
+                                warn!("Connection from {} error: {:?}", peer_addr, err);
+                            }
                         }
                     });
                 }
@@ -334,8 +337,7 @@ async fn proxy(
         }
     }
 
-    let method = req.method();
-    debug!("Proxying request: {} {}", method, req.uri());
+    // Removed debug log for each request to reduce noise
     if let (Some(allowed_domains), Some(request_domain)) =
         (allowed_domains.as_ref(), req.uri().host())
     {
@@ -399,7 +401,7 @@ async fn proxy(
         }
 
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-        debug!("HTTP SOCKS5 #{} connecting to {}", conn_id, addr);
+        // Removed debug log for HTTP connections to reduce noise
 
         // Multi-level warning system for high-capacity server
         if current_connections > MEMORY_PRESSURE_THRESHOLD {
@@ -465,7 +467,10 @@ async fn proxy(
         // Drive the connection and ensure cleanup even if the request times out
         let conn_handle = tokio::spawn(async move {
             if let Err(err) = conn.await {
-                debug!("HTTP #{} connection ended: {:?}", conn_id, err);
+                // Only log significant connection errors
+                if !err.to_string().contains("connection closed") {
+                    warn!("HTTP #{} connection error: {:?}", conn_id, err);
+                }
             }
         });
 
@@ -482,13 +487,13 @@ async fn proxy(
                 result = &mut request_future => {
                     match result {
                         Ok(resp) => {
-                            debug!("HTTP #{} received response after {:?}", conn_id, last_activity.elapsed());
+                            // Removed debug log for response timing to reduce noise
                             break resp;
                         },
                         Err(e) => {
                             conn_handle.abort();
                             let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-                            debug!("HTTP #{} connection error, {} active", conn_id, remaining);
+                            warn!("HTTP #{} connection error, {} active", conn_id, remaining);
                             return Err(e);
                         }
                     }
@@ -499,7 +504,7 @@ async fn proxy(
                     if elapsed >= timeout_duration {
                         conn_handle.abort();
                         let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-                        debug!(
+                        warn!(
                             "HTTP #{} idle timeout after {:?}, {} active",
                             conn_id, elapsed, remaining
                         );
@@ -518,8 +523,8 @@ async fn proxy(
         // We are done with the connection; abort the driver task and close the SOCKS stream
         drop(sender);
         conn_handle.abort();
-        let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-        debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
+        let _remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        // Removed debug log for connection closure to reduce noise
 
         // Return the response body as-is; hyper will forward it to the client
         Ok(resp.map(|b| b.boxed()))
@@ -561,7 +566,7 @@ async fn tunnel(
     }
 
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-    debug!("SOCKS5 tunnel #{} connecting to {}", conn_id, addr);
+    // Removed debug log for tunnel connections to reduce noise
 
     let socks_stream = match auth.as_ref() {
         Some(auth) => {
@@ -617,12 +622,12 @@ async fn tunnel(
             res = client.read(&mut client_buf) => {
                 match res {
                     Ok(0) => {
-                        debug!("Tunnel #{} client connection closed", conn_id);
+                        // Client connection closed normally
                         break;
                     }
                     Ok(n) => {
                         if let Err(e) = server.write_all(&client_buf[..n]).await {
-                            debug!("Tunnel #{} server write error: {}", conn_id, e);
+                            warn!("Tunnel #{} server write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
                         }
@@ -630,7 +635,7 @@ async fn tunnel(
                         idle.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
                     Err(e) => {
-                        debug!("Tunnel #{} client read error: {}", conn_id, e);
+                        warn!("Tunnel #{} client read error: {}", conn_id, e);
                         error = Some(e.into());
                         break;
                     }
@@ -639,12 +644,12 @@ async fn tunnel(
             res = server.read(&mut server_buf) => {
                 match res {
                     Ok(0) => {
-                        debug!("Tunnel #{} server connection closed", conn_id);
+                        // Server connection closed normally
                         break;
                     }
                     Ok(n) => {
                         if let Err(e) = client.write_all(&server_buf[..n]).await {
-                            debug!("Tunnel #{} client write error: {}", conn_id, e);
+                            warn!("Tunnel #{} client write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
                         }
@@ -652,32 +657,32 @@ async fn tunnel(
                         idle.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
                     Err(e) => {
-                        debug!("Tunnel #{} server read error: {}", conn_id, e);
+                        warn!("Tunnel #{} server read error: {}", conn_id, e);
                         error = Some(e.into());
                         break;
                     }
                 }
             }
             _ = &mut idle => {
-                debug!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
+                warn!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
                 break;
             }
         }
     }
 
-    debug!(
-        "Tunnel #{} completed: {}↑ {}↓ bytes",
-        conn_id, from_client, from_server
-    );
+    // Removed debug log for tunnel completion to reduce noise
 
     if let Err(e) = server.shutdown().await {
-        debug!(
-            "Server shutdown error (normal if danted closed first): {}",
-            e
-        );
+        // Only log unexpected shutdown errors
+        if !e.to_string().contains("connection closed") && !e.to_string().contains("broken pipe") {
+            warn!("Server shutdown error: {}", e);
+        }
     }
     if let Err(e) = client.shutdown().await {
-        debug!("Client shutdown error: {}", e);
+        // Only log unexpected shutdown errors
+        if !e.to_string().contains("connection closed") && !e.to_string().contains("broken pipe") {
+            warn!("Client shutdown error: {}", e);
+        }
     }
 
     drop(server);
@@ -685,10 +690,10 @@ async fn tunnel(
 
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
 
-    // Only log detailed stats for significant transfers or when debugging
-    if from_client + from_server > 1024 || tracing::enabled!(tracing::Level::DEBUG) {
-        debug!(
-            "Tunnel #{} completed: {}↑ {}↓ bytes, {} active",
+    // Only log stats for very large transfers to reduce noise
+    if from_client + from_server > 10_485_760 {  // 10MB threshold
+        info!(
+            "Tunnel #{} completed large transfer: {}↑ {}↓ bytes, {} active",
             conn_id, from_client, from_server, remaining
         );
     }
