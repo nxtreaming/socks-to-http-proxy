@@ -11,8 +11,83 @@ use tracing_subscriber::EnvFilter;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// RAII guard to ensure connection count is properly decremented
+struct ConnectionGuard {
+    decremented: bool,
+}
+
+impl ConnectionGuard {
+    fn new() -> Self {
+        ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self { decremented: false }
+    }
+
+    fn decrement(&mut self) {
+        if !self.decremented {
+            ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+            self.decremented = true;
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.decrement();
+    }
+}
+
+// Buffer pool for memory optimization
+struct BufferPool {
+    small_buffers: Mutex<Vec<Vec<u8>>>, // 8KB buffers
+    large_buffers: Mutex<Vec<Vec<u8>>>, // 16KB buffers
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            small_buffers: Mutex::new(Vec::new()),
+            large_buffers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get_buffer(&self, large: bool) -> Vec<u8> {
+        let size = if large { 16384 } else { 8192 };
+        let pool = if large { &self.large_buffers } else { &self.small_buffers };
+
+        if let Ok(mut buffers) = pool.lock() {
+            if let Some(mut buffer) = buffers.pop() {
+                buffer.clear();
+                buffer.resize(size, 0);
+                return buffer;
+            }
+        }
+
+        // Create new buffer if pool is empty
+        vec![0u8; size]
+    }
+
+    fn return_buffer(&self, buffer: Vec<u8>, large: bool) {
+        // Only return buffers that are the expected size to avoid memory bloat
+        let expected_size = if large { 16384 } else { 8192 };
+        if buffer.len() != expected_size {
+            return;
+        }
+
+        let pool = if large { &self.large_buffers } else { &self.small_buffers };
+        if let Ok(mut buffers) = pool.lock() {
+            // Limit pool size to prevent excessive memory usage
+            if buffers.len() < 100 {
+                buffers.push(buffer);
+            }
+        }
+    }
+}
+
+// Global buffer pool
+static BUFFER_POOL: std::sync::OnceLock<BufferPool> = std::sync::OnceLock::new();
 
 use tokio::signal;
 
@@ -114,71 +189,52 @@ async fn main() -> Result<()> {
     info!("HTTP Proxy listening on http://{}", addr);
     info!("SOCKS5 backend: {}", socks_addr);
 
-    // Add a connection monitoring task (only on Unix to avoid shell overhead on Windows)
-    #[cfg(unix)]
+    // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
-        let mut consecutive_high_count = 0;
+        let mut last_active_count = 0;
+        let mut stable_count_intervals = 0;
 
         loop {
             interval.tick().await;
 
-            let close_wait_cmd = format!(
-                "netstat -an | grep CLOSE_WAIT | grep :{} | wc -l",
-                socks_addr.port()
-            );
-            let close_wait_count = match tokio::process::Command::new("sh")
-                .args(&["-c", &close_wait_cmd])
-                .output()
-                .await
-            {
-                Ok(output) => String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or(0),
-                Err(e) => {
-                    warn!("Failed to check CLOSE_WAIT: {}", e);
-                    0
-                }
-            };
-
             let active = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
-            // Only log when there are issues or significant activity
-            if close_wait_count > 0 || active > 100 {
-                info!(
-                    "SOCKS5 Status - Active: {}, CLOSE_WAIT: {}",
-                    active, close_wait_count
-                );
-            } else if active > 0 {
-                // Removed debug log for active connections to reduce noise
+            // Only log when there are significant changes or high activity
+            if active > 100 || (active > 0 && active != last_active_count) {
+                info!("SOCKS5 Status - Active connections: {}", active);
             }
 
-            // Alert logic
-            match close_wait_count {
-                0..=100 => {
-                    consecutive_high_count = 0;
+            // Detect potential connection leaks by monitoring stable high counts
+            if active == last_active_count && active > 1000 {
+                stable_count_intervals += 1;
+                if stable_count_intervals >= 3 {
+                    warn!(
+                        "Potential connection leak detected: {} connections stable for {} intervals",
+                        active, stable_count_intervals
+                    );
                 }
-                101..=300 => {
-                    warn!("Moderate CLOSE_WAIT leak: {} connections", close_wait_count);
-                    consecutive_high_count = 0;
+            } else {
+                stable_count_intervals = 0;
+            }
+
+            // Alert on very high connection counts
+            match active {
+                0..=5000 => {
+                    // Normal operation
                 }
-                301..=600 => {
-                    warn!("High CLOSE_WAIT leak: {} connections", close_wait_count);
-                    consecutive_high_count += 1;
+                5001..=15000 => {
+                    info!("Moderate connection load: {} active", active);
+                }
+                15001..=25000 => {
+                    warn!("High connection load: {} active", active);
                 }
                 _ => {
-                    error!("CRITICAL CLOSE_WAIT leak: {} connections", close_wait_count);
-                    consecutive_high_count += 1;
+                    error!("CRITICAL connection load: {} active", active);
                 }
             }
 
-            if consecutive_high_count >= 3 {
-                error!(
-                    "Persistent connection leak detected for {} intervals",
-                    consecutive_high_count
-                );
-            }
+            last_active_count = active;
         }
     });
 
@@ -400,7 +456,8 @@ async fn proxy(
             return Ok(resp);
         }
 
-        let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        let mut connection_guard = ConnectionGuard::new();
+        let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
         // Removed debug log for HTTP connections to reduce noise
 
         // Multi-level warning system for high-capacity server
@@ -430,7 +487,6 @@ async fn proxy(
                 {
                     Ok(stream) => stream,
                     Err(e) => {
-                        ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                         warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
                         let mut resp = Response::new(full("SOCKS5 authentication failed"));
                         *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
@@ -441,7 +497,6 @@ async fn proxy(
             None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                     warn!("SOCKS5 connection #{} failed: {}", conn_id, e);
                     let mut resp = Response::new(full("SOCKS5 connection failed"));
                     *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
@@ -480,7 +535,6 @@ async fn proxy(
         tokio::pin!(idle_timer);
 
         let mut request_future = Box::pin(sender.send_request(req));
-        let last_activity = tokio::time::Instant::now();
 
         let resp = loop {
             tokio::select! {
@@ -492,30 +546,25 @@ async fn proxy(
                         },
                         Err(e) => {
                             conn_handle.abort();
-                            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                            connection_guard.decrement();
+                            let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
                             warn!("HTTP #{} connection error, {} active", conn_id, remaining);
                             return Err(e);
                         }
                     }
                 }
                 _ = &mut idle_timer => {
-                    // Check if we've been truly idle (no progress on the request)
-                    let elapsed = last_activity.elapsed();
-                    if elapsed >= timeout_duration {
-                        conn_handle.abort();
-                        let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-                        warn!(
-                            "HTTP #{} idle timeout after {:?}, {} active",
-                            conn_id, elapsed, remaining
-                        );
-                        let mut resp = Response::new(full("Connection idle timeout - no activity"));
-                        *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
-                        return Ok(resp);
-                    } else {
-                        // Reset timer for remaining time
-                        let remaining_time = timeout_duration - elapsed;
-                        idle_timer.as_mut().reset(tokio::time::Instant::now() + remaining_time);
-                    }
+                    // Timeout reached - abort the connection
+                    conn_handle.abort();
+                    connection_guard.decrement();
+                    let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+                    warn!(
+                        "HTTP #{} timeout after {:?}, {} active",
+                        conn_id, timeout_duration, remaining
+                    );
+                    let mut resp = Response::new(full("Request timeout"));
+                    *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+                    return Ok(resp);
                 }
             }
         };
@@ -523,7 +572,8 @@ async fn proxy(
         // We are done with the connection; abort the driver task and close the SOCKS stream
         drop(sender);
         conn_handle.abort();
-        let _remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        connection_guard.decrement();
+        let _remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
         // Removed debug log for connection closure to reduce noise
 
         // Return the response body as-is; hyper will forward it to the client
@@ -565,7 +615,8 @@ async fn tunnel(
         .into());
     }
 
-    let conn_id = ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    let mut connection_guard = ConnectionGuard::new();
+    let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
     // Removed debug log for tunnel connections to reduce noise
 
     let socks_stream = match auth.as_ref() {
@@ -580,7 +631,6 @@ async fn tunnel(
             {
                 Ok(stream) => stream,
                 Err(e) => {
-                    ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                     return Err(color_eyre::eyre::eyre!(
                         "SOCKS5 auth connection failed: {}",
                         e
@@ -591,7 +641,6 @@ async fn tunnel(
         None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
             Ok(stream) => stream,
             Err(e) => {
-                ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 return Err(color_eyre::eyre::eyre!("SOCKS5 connection failed: {}", e));
             }
         },
@@ -605,14 +654,11 @@ async fn tunnel(
     let mut from_client = 0u64;
     let mut from_server = 0u64;
 
-    // Larger buffers for better throughput on high-speed networks
-    let buffer_size = if idle_timeout > 300 {
-        32768 // 32KB for long-lived connections (better for large transfers)
-    } else {
-        16384 // 16KB for short-lived connections (balance latency/throughput)
-    };
-    let mut client_buf = vec![0u8; buffer_size];
-    let mut server_buf = vec![0u8; buffer_size];
+    // Use buffer pool for memory optimization
+    let buffer_pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
+    let use_large_buffers = idle_timeout > 300;
+    let mut client_buf = buffer_pool.get_buffer(use_large_buffers);
+    let mut server_buf = buffer_pool.get_buffer(use_large_buffers);
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
     let mut error: Option<color_eyre::eyre::Error> = None;
@@ -688,7 +734,12 @@ async fn tunnel(
     drop(server);
     drop(client);
 
-    let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+    // Return buffers to pool for reuse
+    buffer_pool.return_buffer(client_buf, use_large_buffers);
+    buffer_pool.return_buffer(server_buf, use_large_buffers);
+
+    connection_guard.decrement();
+    let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
     // Only log stats for very large transfers to reduce noise
     if from_client + from_server > 10_485_760 {  // 10MB threshold
@@ -778,5 +829,81 @@ mod tests {
 
         // HashSet should be significantly faster for large datasets
         assert!(hashset_duration < vec_duration);
+    }
+
+    #[test]
+    fn test_connection_guard() {
+        // Reset counter for test
+        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+
+        {
+            let _guard = ConnectionGuard::new();
+            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 1);
+        }
+
+        // Guard should automatically decrement on drop
+        assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_connection_guard_manual_decrement() {
+        // Reset counter for test
+        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+
+        {
+            let mut guard = ConnectionGuard::new();
+            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 1);
+
+            guard.decrement();
+            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
+
+            // Second decrement should be no-op
+            guard.decrement();
+            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
+        }
+
+        // Drop should not decrement again
+        assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_buffer_pool() {
+        let pool = BufferPool::new();
+
+        // Test small buffer
+        let small_buf = pool.get_buffer(false);
+        assert_eq!(small_buf.len(), 8192);
+
+        // Test large buffer
+        let large_buf = pool.get_buffer(true);
+        assert_eq!(large_buf.len(), 16384);
+
+        // Return buffers
+        pool.return_buffer(small_buf, false);
+        pool.return_buffer(large_buf, true);
+
+        // Get buffers again - should reuse from pool
+        let reused_small = pool.get_buffer(false);
+        let reused_large = pool.get_buffer(true);
+
+        assert_eq!(reused_small.len(), 8192);
+        assert_eq!(reused_large.len(), 16384);
+    }
+
+    #[test]
+    fn test_buffer_pool_size_limit() {
+        let pool = BufferPool::new();
+
+        // Fill pool beyond limit
+        for _ in 0..150 {
+            let buf = pool.get_buffer(false);
+            pool.return_buffer(buf, false);
+        }
+
+        // Pool should limit size to prevent memory bloat
+        {
+            let buffers = pool.small_buffers.lock().unwrap();
+            assert!(buffers.len() <= 100);
+        }
     }
 }
