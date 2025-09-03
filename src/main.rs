@@ -55,7 +55,11 @@ impl BufferPool {
 
     fn get_buffer(&self, large: bool) -> Vec<u8> {
         let size = if large { 16384 } else { 8192 };
-        let pool = if large { &self.large_buffers } else { &self.small_buffers };
+        let pool = if large {
+            &self.large_buffers
+        } else {
+            &self.small_buffers
+        };
 
         if let Ok(mut buffers) = pool.lock() {
             if let Some(mut buffer) = buffers.pop() {
@@ -76,7 +80,11 @@ impl BufferPool {
             return;
         }
 
-        let pool = if large { &self.large_buffers } else { &self.small_buffers };
+        let pool = if large {
+            &self.large_buffers
+        } else {
+            &self.small_buffers
+        };
         if let Ok(mut buffers) = pool.lock() {
             // Limit pool size to prevent excessive memory usage
             if buffers.len() < 100 {
@@ -536,36 +544,34 @@ async fn proxy(
 
         let mut request_future = Box::pin(sender.send_request(req));
 
-        let resp = loop {
-            tokio::select! {
-                result = &mut request_future => {
-                    match result {
-                        Ok(resp) => {
-                            // Removed debug log for response timing to reduce noise
-                            break resp;
-                        },
-                        Err(e) => {
-                            conn_handle.abort();
-                            connection_guard.decrement();
-                            let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-                            warn!("HTTP #{} connection error, {} active", conn_id, remaining);
-                            return Err(e);
-                        }
+        let resp = tokio::select! {
+            result = &mut request_future => {
+                match result {
+                    Ok(resp) => {
+                        // Removed debug log for response timing to reduce noise
+                        resp
+                    },
+                    Err(e) => {
+                        conn_handle.abort();
+                        connection_guard.decrement();
+                        let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+                        warn!("HTTP #{} connection error, {} active", conn_id, remaining);
+                        return Err(e);
                     }
                 }
-                _ = &mut idle_timer => {
-                    // Timeout reached - abort the connection
-                    conn_handle.abort();
-                    connection_guard.decrement();
-                    let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-                    warn!(
-                        "HTTP #{} timeout after {:?}, {} active",
-                        conn_id, timeout_duration, remaining
-                    );
-                    let mut resp = Response::new(full("Request timeout"));
-                    *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
-                    return Ok(resp);
-                }
+            }
+            _ = &mut idle_timer => {
+                // Timeout reached - abort the connection
+                conn_handle.abort();
+                connection_guard.decrement();
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+                warn!(
+                    "HTTP #{} timeout after {:?}, {} active",
+                    conn_id, timeout_duration, remaining
+                );
+                let mut resp = Response::new(full("Request timeout"));
+                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+                return Ok(resp);
             }
         };
 
@@ -655,7 +661,7 @@ async fn tunnel(
     let mut from_server = 0u64;
 
     // Use buffer pool for memory optimization
-    let buffer_pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
+    let buffer_pool = BUFFER_POOL.get_or_init(BufferPool::new);
     let use_large_buffers = idle_timeout > 300;
     let mut client_buf = buffer_pool.get_buffer(use_large_buffers);
     let mut server_buf = buffer_pool.get_buffer(use_large_buffers);
@@ -742,7 +748,8 @@ async fn tunnel(
     let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
     // Only log stats for very large transfers to reduce noise
-    if from_client + from_server > 10_485_760 {  // 10MB threshold
+    if from_client + from_server > 10_485_760 {
+        // 10MB threshold
         info!(
             "Tunnel #{} completed large transfer: {}↑ {}↓ bytes, {} active",
             conn_id, from_client, from_server, remaining
