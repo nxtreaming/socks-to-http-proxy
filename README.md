@@ -47,3 +47,76 @@ Options:
   -h, --help                               Print help information
   -V, --version                            Print version information
 ```
+
+## Log Level Control
+
+`sthp` uses structured logging with different levels to help you monitor and debug the proxy. By default, it runs at `warn` level for optimal performance in production environments.
+
+### Log Levels
+
+- **error**: Only critical errors that may cause service interruption
+- **warn**: Warnings including connection errors, timeouts, and important status changes (default)
+- **info**: General information including service startup, high connection counts, and large file transfers
+- **debug**: Detailed debugging information including all connections and data transfers
+
+### Usage Examples
+
+**Default (warn level) - Recommended for production:**
+```bash
+sthp -p 8080 -s 127.0.0.1:1080
+```
+
+**Enable debug logging for troubleshooting:**
+```bash
+RUST_LOG=sthp=debug sthp -p 8080 -s 127.0.0.1:1080
+```
+
+**Show only errors:**
+```bash
+RUST_LOG=sthp=error sthp -p 8080 -s 127.0.0.1:1080
+```
+
+**Enable info level logging:**
+```bash
+RUST_LOG=sthp=info sthp -p 8080 -s 127.0.0.1:1080
+```
+
+**Advanced logging configuration:**
+```bash
+# Enable debug for sthp but warn for other crates
+RUST_LOG=sthp=debug,warn sthp -p 8080 -s 127.0.0.1:1080
+
+# Log to file
+RUST_LOG=sthp=info sthp -p 8080 -s 127.0.0.1:1080 > proxy.log 2>&1
+```
+
+### Performance Impact
+
+- **warn/error**: Minimal performance impact, recommended for production
+- **info**: Slight performance impact, good for monitoring
+- **debug**: Noticeable performance impact, use only for troubleshooting
+
+### What Gets Logged at Each Level
+
+**Error Level:**
+- Service startup failures
+- Critical connection limits reached
+- Severe system errors
+
+**Warn Level (Default):**
+- Connection errors and timeouts
+- SOCKS5 authentication failures
+- Domain access violations
+- I/O errors during data transfer
+
+**Info Level:**
+- Service startup information
+- Connection count warnings
+- Large file transfer completions (>10MB)
+- System status updates
+
+**Debug Level:**
+- Individual connection details
+- Request/response timing
+- Detailed error traces
+- Connection lifecycle events
