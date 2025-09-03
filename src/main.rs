@@ -377,7 +377,15 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        let host = req.uri().host().expect("uri has no host");
+        let host = match req.uri().host() {
+            Some(h) => h,
+            None => {
+                warn!("HTTP request missing host: {:?}", req.uri());
+                let mut resp = Response::new(full("HTTP request missing host"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                return Ok(resp);
+            }
+        };
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
@@ -454,25 +462,47 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Simple connection handling for better performance
-        tokio::task::spawn(async move {
+        // Drive the connection and ensure cleanup even if the request times out
+        let conn_handle = tokio::spawn(async move {
             if let Err(err) = conn.await {
                 debug!("HTTP #{} connection ended: {:?}", conn_id, err);
             }
-            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
         });
 
-        // Send the request
-        let resp = sender.send_request(req).await?;
+        // Apply timeout to the outbound request to avoid hanging connections
+        let resp = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(idle_timeout),
+            sender.send_request(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                conn_handle.abort();
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                debug!("HTTP #{} connection error, {} active", conn_id, remaining);
+                return Err(e);
+            }
+            Err(_) => {
+                conn_handle.abort();
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                debug!(
+                    "HTTP #{} connection timed out, {} active",
+                    conn_id, remaining
+                );
+                let mut resp = Response::new(full("SOCKS5 connection timed out"));
+                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+                return Ok(resp);
+            }
+        };
 
-        // Ensure immediate resource cleanup when client disconnects
-        // This prevents "zombie sessions" that waste backend connections
+        // We are done with the connection; abort the driver task and close the SOCKS stream
         drop(sender);
+        conn_handle.abort();
+        let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
 
-        // Critical fix: Ensure response body will be properly handled
-        // The response body must be consumed by the client to prevent CLOSE_WAIT
-        // We return the response as-is, but the HTTP framework will handle consumption
+        // Return the response body as-is; hyper will forward it to the client
         Ok(resp.map(|b| b.boxed()))
     }
 }
@@ -561,28 +591,53 @@ async fn tunnel(
     let mut server_buf = vec![0u8; buffer_size];
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
+    let mut error: Option<color_eyre::eyre::Error> = None;
 
     loop {
         tokio::select! {
             res = client.read(&mut client_buf) => {
-                let n = res?;
-                if n == 0 {
-                    debug!("Tunnel #{} client connection closed", conn_id);
-                    break;
+                match res {
+                    Ok(0) => {
+                        debug!("Tunnel #{} client connection closed", conn_id);
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = server.write_all(&client_buf[..n]).await {
+                            debug!("Tunnel #{} server write error: {}", conn_id, e);
+                            error = Some(e.into());
+                            break;
+                        }
+                        from_client += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => {
+                        debug!("Tunnel #{} client read error: {}", conn_id, e);
+                        error = Some(e.into());
+                        break;
+                    }
                 }
-                server.write_all(&client_buf[..n]).await?;
-                from_client += n as u64;
-                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             res = server.read(&mut server_buf) => {
-                let n = res?;
-                if n == 0 {
-                    debug!("Tunnel #{} server connection closed", conn_id);
-                    break;
+                match res {
+                    Ok(0) => {
+                        debug!("Tunnel #{} server connection closed", conn_id);
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = client.write_all(&server_buf[..n]).await {
+                            debug!("Tunnel #{} client write error: {}", conn_id, e);
+                            error = Some(e.into());
+                            break;
+                        }
+                        from_server += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => {
+                        debug!("Tunnel #{} server read error: {}", conn_id, e);
+                        error = Some(e.into());
+                        break;
+                    }
                 }
-                client.write_all(&server_buf[..n]).await?;
-                from_server += n as u64;
-                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             _ = &mut idle => {
                 debug!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
@@ -618,7 +673,9 @@ async fn tunnel(
             conn_id, from_client, from_server, remaining
         );
     }
-
+    if let Some(e) = error {
+        return Err(e);
+    }
     Ok(())
 }
 
