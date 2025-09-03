@@ -454,25 +454,47 @@ async fn proxy(
             .handshake(io)
             .await?;
 
-        // Simple connection handling for better performance
-        tokio::task::spawn(async move {
+        // Drive the connection and ensure cleanup even if the request times out
+        let conn_handle = tokio::spawn(async move {
             if let Err(err) = conn.await {
                 debug!("HTTP #{} connection ended: {:?}", conn_id, err);
             }
-            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
         });
 
-        // Send the request
-        let resp = sender.send_request(req).await?;
+        // Apply timeout to the outbound request to avoid hanging connections
+        let resp = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(idle_timeout),
+            sender.send_request(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                conn_handle.abort();
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                debug!("HTTP #{} connection error, {} active", conn_id, remaining);
+                return Err(e);
+            }
+            Err(_) => {
+                conn_handle.abort();
+                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                debug!(
+                    "HTTP #{} connection timed out, {} active",
+                    conn_id, remaining
+                );
+                let mut resp = Response::new(full("SOCKS5 connection timed out"));
+                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+                return Ok(resp);
+            }
+        };
 
-        // Ensure immediate resource cleanup when client disconnects
-        // This prevents "zombie sessions" that waste backend connections
+        // We are done with the connection; abort the driver task and close the SOCKS stream
         drop(sender);
+        conn_handle.abort();
+        let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        debug!("HTTP #{} connection closed, {} active", conn_id, remaining);
 
-        // Critical fix: Ensure response body will be properly handled
-        // The response body must be consumed by the client to prevent CLOSE_WAIT
-        // We return the response as-is, but the HTTP framework will handle consumption
+        // Return the response body as-is; hyper will forward it to the client
         Ok(resp.map(|b| b.boxed()))
     }
 }
