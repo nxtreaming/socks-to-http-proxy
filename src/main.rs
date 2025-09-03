@@ -377,7 +377,15 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        let host = req.uri().host().expect("uri has no host");
+        let host = match req.uri().host() {
+            Some(h) => h,
+            None => {
+                warn!("HTTP request missing host: {:?}", req.uri());
+                let mut resp = Response::new(full("HTTP request missing host"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                return Ok(resp);
+            }
+        };
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
@@ -602,28 +610,53 @@ async fn tunnel(
     let mut server_buf = vec![0u8; buffer_size];
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
+    let mut error: Option<color_eyre::eyre::Error> = None;
 
     loop {
         tokio::select! {
             res = client.read(&mut client_buf) => {
-                let n = res?;
-                if n == 0 {
-                    debug!("Tunnel #{} client connection closed", conn_id);
-                    break;
+                match res {
+                    Ok(0) => {
+                        debug!("Tunnel #{} client connection closed", conn_id);
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = server.write_all(&client_buf[..n]).await {
+                            debug!("Tunnel #{} server write error: {}", conn_id, e);
+                            error = Some(e.into());
+                            break;
+                        }
+                        from_client += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => {
+                        debug!("Tunnel #{} client read error: {}", conn_id, e);
+                        error = Some(e.into());
+                        break;
+                    }
                 }
-                server.write_all(&client_buf[..n]).await?;
-                from_client += n as u64;
-                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             res = server.read(&mut server_buf) => {
-                let n = res?;
-                if n == 0 {
-                    debug!("Tunnel #{} server connection closed", conn_id);
-                    break;
+                match res {
+                    Ok(0) => {
+                        debug!("Tunnel #{} server connection closed", conn_id);
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = client.write_all(&server_buf[..n]).await {
+                            debug!("Tunnel #{} client write error: {}", conn_id, e);
+                            error = Some(e.into());
+                            break;
+                        }
+                        from_server += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => {
+                        debug!("Tunnel #{} server read error: {}", conn_id, e);
+                        error = Some(e.into());
+                        break;
+                    }
                 }
-                client.write_all(&server_buf[..n]).await?;
-                from_server += n as u64;
-                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
             _ = &mut idle => {
                 debug!("Tunnel #{} idle timeout after {:?}, closing", conn_id, timeout);
@@ -659,7 +692,9 @@ async fn tunnel(
             conn_id, from_client, from_server, remaining
         );
     }
-
+    if let Some(e) = error {
+        return Err(e);
+    }
     Ok(())
 }
 
