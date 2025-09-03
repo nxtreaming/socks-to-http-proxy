@@ -461,30 +461,49 @@ async fn proxy(
             }
         });
 
-        // Apply timeout to the outbound request to avoid hanging connections
-        let resp = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(idle_timeout),
-            sender.send_request(req),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                conn_handle.abort();
-                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-                debug!("HTTP #{} connection error, {} active", conn_id, remaining);
-                return Err(e);
-            }
-            Err(_) => {
-                conn_handle.abort();
-                let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-                debug!(
-                    "HTTP #{} connection timed out, {} active",
-                    conn_id, remaining
-                );
-                let mut resp = Response::new(full("SOCKS5 connection timed out"));
-                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
-                return Ok(resp);
+        // Apply idle timeout with activity monitoring for HTTP requests
+        let timeout_duration = tokio::time::Duration::from_secs(idle_timeout);
+        let idle_timer = tokio::time::sleep(timeout_duration);
+        tokio::pin!(idle_timer);
+
+        let mut request_future = Box::pin(sender.send_request(req));
+        let last_activity = tokio::time::Instant::now();
+
+        let resp = loop {
+            tokio::select! {
+                result = &mut request_future => {
+                    match result {
+                        Ok(resp) => {
+                            debug!("HTTP #{} received response after {:?}", conn_id, last_activity.elapsed());
+                            break resp;
+                        },
+                        Err(e) => {
+                            conn_handle.abort();
+                            let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                            debug!("HTTP #{} connection error, {} active", conn_id, remaining);
+                            return Err(e);
+                        }
+                    }
+                }
+                _ = &mut idle_timer => {
+                    // Check if we've been truly idle (no progress on the request)
+                    let elapsed = last_activity.elapsed();
+                    if elapsed >= timeout_duration {
+                        conn_handle.abort();
+                        let remaining = ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                        debug!(
+                            "HTTP #{} idle timeout after {:?}, {} active",
+                            conn_id, elapsed, remaining
+                        );
+                        let mut resp = Response::new(full("Connection idle timeout - no activity"));
+                        *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+                        return Ok(resp);
+                    } else {
+                        // Reset timer for remaining time
+                        let remaining_time = timeout_duration - elapsed;
+                        idle_timer.as_mut().reset(tokio::time::Instant::now() + remaining_time);
+                    }
+                }
             }
         };
 
