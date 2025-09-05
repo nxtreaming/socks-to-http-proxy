@@ -8,8 +8,8 @@ use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -97,6 +97,46 @@ impl BufferPool {
 // Global buffer pool
 static BUFFER_POOL: std::sync::OnceLock<BufferPool> = std::sync::OnceLock::new();
 
+// Per-IP connection tracking
+struct IpConnectionTracker {
+    connections: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl IpConnectionTracker {
+    fn new() -> Self {
+        Self {
+            connections: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn increment(&self, ip: IpAddr) -> usize {
+        let mut connections = self.connections.lock().unwrap();
+        let count = connections.entry(ip).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    fn decrement(&self, ip: IpAddr) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(count) = connections.get_mut(&ip) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                connections.remove(&ip);
+            }
+        }
+    }
+
+    fn get_count(&self, ip: IpAddr) -> usize {
+        let connections = self.connections.lock().unwrap();
+        connections.get(&ip).copied().unwrap_or(0)
+    }
+}
+
+// Global IP connection tracker
+static IP_TRACKER: std::sync::OnceLock<IpConnectionTracker> = std::sync::OnceLock::new();
+
 use tokio::signal;
 
 use base64::engine::general_purpose;
@@ -165,6 +205,10 @@ struct Cli {
     /// Idle timeout in seconds for tunnel connections
     #[arg(long, default_value_t = 540)]
     idle_timeout: u64,
+
+    /// Maximum connections per IP address
+    #[arg(long, default_value_t = 500)]
+    max_connections_per_ip: usize,
 }
 
 #[tokio::main]
@@ -192,6 +236,7 @@ async fn main() -> Result<()> {
     let http_basic = Arc::new(http_basic);
     let no_httpauth = args.no_httpauth == 1;
     let idle_timeout = args.idle_timeout;
+    let max_connections_per_ip = args.max_connections_per_ip;
 
     let listener = TcpListener::bind(addr).await?;
     info!("HTTP Proxy listening on http://{}", addr);
@@ -287,7 +332,23 @@ async fn main() -> Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
-                    // Removed debug log for new connections to reduce noise
+                    // Check per-IP connection limits
+                    let ip_tracker = IP_TRACKER.get_or_init(|| IpConnectionTracker::new());
+                    let client_ip = peer_addr.ip();
+                    let current_ip_connections = ip_tracker.get_count(client_ip);
+
+                    if current_ip_connections >= max_connections_per_ip {
+                        warn!("Connection limit exceeded for IP {}: {} connections", client_ip, current_ip_connections);
+                        // Close the connection immediately
+                        drop(stream);
+                        continue;
+                    }
+
+                    // Increment connection count for this IP
+                    let new_count = ip_tracker.increment(client_ip);
+                    if new_count > 20 {
+                        info!("High connection count for IP {}: {} connections", client_ip, new_count);
+                    }
 
                     let auth = auth.clone();
                     let http_basic = http_basic.clone();
@@ -318,6 +379,9 @@ async fn main() -> Result<()> {
                                 warn!("Connection from {} error: {:?}", peer_addr, err);
                             }
                         }
+
+                        // Decrement IP connection count when connection ends
+                        ip_tracker.decrement(client_ip);
                     });
                 }
                 Err(e) => {
