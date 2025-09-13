@@ -13,6 +13,21 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::signal;
+
+use base64::engine::general_purpose;
+use base64::Engine;
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::client::conn::http1::Builder;
+use hyper::header::{HeaderValue, PROXY_AUTHENTICATE};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
+use hyper::{Method, Request, Response};
+
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 
 // RAII guard to ensure connection count is properly decremented
 struct ConnectionGuard {
@@ -137,22 +152,6 @@ impl IpConnectionTracker {
 // Global IP connection tracker
 static IP_TRACKER: std::sync::OnceLock<IpConnectionTracker> = std::sync::OnceLock::new();
 
-use tokio::signal;
-
-use base64::engine::general_purpose;
-use base64::Engine;
-use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
-use hyper::client::conn::http1::Builder;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::upgrade::Upgraded;
-use hyper::{Method, Request, Response};
-
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
-
 // Global counter for tracking active SOCKS5 connections
 static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -207,8 +206,11 @@ struct Cli {
     idle_timeout: u64,
 
     /// Maximum connections per IP address
-    #[arg(long, default_value_t = 500)]
-    max_connections_per_ip: usize,
+    #[arg(long = "conn-per-ip", default_value_t = 500)]
+    conn_per_ip: usize,
+    /// Force 'Connection: close' on forwarded HTTP requests
+    #[arg(long, default_value_t = true)]
+    force_close: bool,
 }
 
 #[tokio::main]
@@ -236,7 +238,8 @@ async fn main() -> Result<()> {
     let http_basic = Arc::new(http_basic);
     let no_httpauth = args.no_httpauth == 1;
     let idle_timeout = args.idle_timeout;
-    let max_connections_per_ip = args.max_connections_per_ip;
+    let conn_per_ip = args.conn_per_ip;
+    let force_close = args.force_close;
 
     let listener = TcpListener::bind(addr).await?;
     info!("HTTP Proxy listening on http://{}", addr);
@@ -337,7 +340,7 @@ async fn main() -> Result<()> {
                     let client_ip = peer_addr.ip();
                     let current_ip_connections = ip_tracker.get_count(client_ip);
 
-                    if current_ip_connections >= max_connections_per_ip {
+                    if current_ip_connections >= conn_per_ip {
                         warn!("Connection limit exceeded for IP {}: {} connections", client_ip, current_ip_connections);
                         // Close the connection immediately
                         drop(stream);
@@ -364,6 +367,7 @@ async fn main() -> Result<()> {
                                 allowed_domains.clone(),
                                 no_httpauth,
                                 idle_timeout,
+                                force_close,
                             )
                         });
 
@@ -385,12 +389,8 @@ async fn main() -> Result<()> {
                     });
                 }
                 Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    // Return an error to break the loop and shutdown gracefully
-                    return Err::<(), color_eyre::eyre::Error>(color_eyre::eyre::eyre!(
-                        "Accept error: {}",
-                        e
-                    ));
+                    warn!("Accept error: {} (continuing)", e);
+                    continue;
                 }
             }
         }
@@ -398,10 +398,9 @@ async fn main() -> Result<()> {
 
     // Run server until the shutdown signal is received
     tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
-            }
+        _ = server => {
+            // Server loop ended unexpectedly
+            warn!("Server loop terminated");
         }
         _ = shutdown => {
             info!("Server shutdown complete");
@@ -419,6 +418,7 @@ async fn proxy(
     allowed_domains: Arc<Option<HashSet<String>>>,
     no_httpauth: bool,
     idle_timeout: u64,
+    force_close: bool,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Early return for disabled authentication
     if no_httpauth {
@@ -431,14 +431,8 @@ async fn proxy(
             Some(header) => header,
             None => {
                 // When the request does not contain a Proxy-Authorization header,
-                // send a 407 response code and a Proxy-Authenticate header
-                let mut response = Response::new(full("Proxy authentication required"));
-                *response.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
-                response.headers_mut().insert(
-                    PROXY_AUTHENTICATE,
-                    HeaderValue::from_static("Basic realm=\"proxy\""),
-                );
-                return Ok(response);
+                // send a 407 response with Proxy-Authenticate header
+                return Ok(proxy_auth_required_response("Proxy authentication required"));
             }
         };
 
@@ -447,20 +441,12 @@ async fn proxy(
             Some(expected_auth) => {
                 if auth_header != expected_auth {
                     warn!("Failed to authenticate: {:?}", headers);
-                    let mut resp = Response::new(full(
-                        "Authorization failed, you are not allowed through the proxy.",
-                    ));
-                    *resp.status_mut() = http::StatusCode::FORBIDDEN;
-                    return Ok(resp);
+                    return Ok(proxy_auth_required_response("Proxy authentication required"));
                 }
             }
             None => {
                 warn!("HTTP Basic auth not configured but required");
-                let mut resp = Response::new(full(
-                    "Authorization failed, you are not allowed through the proxy.",
-                ));
-                *resp.status_mut() = http::StatusCode::FORBIDDEN;
-                return Ok(resp);
+                return Ok(proxy_auth_required_response("Proxy authentication required"));
             }
         }
     }
@@ -469,7 +455,7 @@ async fn proxy(
     if let (Some(allowed_domains), Some(request_domain)) =
         (allowed_domains.as_ref(), req.uri().host())
     {
-        if !allowed_domains.contains(request_domain) {
+        if !is_domain_allowed(allowed_domains, request_domain) {
             warn!(
                 "Access to domain {} is not allowed through the proxy.",
                 request_domain
@@ -577,11 +563,13 @@ async fn proxy(
             },
         };
 
-        // Force Connection: close for stability (prevents CLOSE_WAIT issues)
+        // Optionally force Connection: close for stability (prevents CLOSE_WAIT issues)
         // This trades some performance for better connection management
         let mut req = req;
-        req.headers_mut()
-            .insert("connection", HeaderValue::from_static("close"));
+        if force_close {
+            req.headers_mut()
+                .insert("connection", HeaderValue::from_static("close"));
+        }
 
         let io = TokioIo::new(socks_stream);
 
@@ -639,11 +627,19 @@ async fn proxy(
             }
         };
 
-        // We are done with the connection; abort the driver task and close the SOCKS stream
-        drop(sender);
-        conn_handle.abort();
-        connection_guard.decrement();
-        let _remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+        // We are done initiating the request. Keep driving the connection in background
+        // Note on `sender`: in hyper's (sender, conn) model, `conn` is the I/O driver
+        // that must keep running to stream the response body. Explicitly calling
+        // drop(sender) here is not required for a clean shutdown; dropping it only
+        // prevents issuing more requests and it will be dropped at scope end anyway.
+        // We keep the driver alive until EOF to avoid truncating large/slow responses.
+
+        // and decrement the active counter only after the connection fully closes.
+        let _close_task = tokio::spawn(async move {
+            let _ = conn_handle.await; // wait for connection driver to finish
+            drop(connection_guard); // RAII drop -> decrement
+        });
+        // Intentionally do not abort conn_handle; it will finish when the connection shuts down.
         // Removed debug log for connection closure to reduce noise
 
         // Return the response body as-is; hyper will forward it to the client
@@ -655,10 +651,52 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().map(|auth| auth.to_string())
 }
 
+fn is_domain_allowed(allowed: &std::collections::HashSet<String>, host: &str) -> bool {
+    if allowed.contains("*") {
+        return true;
+    }
+    if allowed.contains(host) {
+        return true;
+    }
+    for pat in allowed {
+        if let Some(suffix) = pat.strip_prefix("*.") {
+            // Match any subdomain of suffix (but not the apex)
+            if host.ends_with(suffix) {
+
+
+                // Ensure there is a dot boundary before suffix
+                if host.len() > suffix.len() && host.as_bytes()[host.len() - suffix.len() - 1] == b'.' {
+                    return true;
+                }
+            }
+        } else if let Some(suffix) = pat.strip_prefix('.') {
+            // Match apex or any subdomain of suffix
+            if host == suffix {
+                return true;
+            }
+            if host.ends_with(suffix) {
+                if host.len() > suffix.len() && host.as_bytes()[host.len() - suffix.len() - 1] == b'.' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn empty() -> BoxBody<Bytes, hyper::Error> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut response = Response::new(full(msg));
+    *response.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+    response
+        .headers_mut()
+        .insert(PROXY_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"proxy\""));
+    response
 }
 
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
@@ -977,4 +1015,39 @@ mod tests {
             assert!(buffers.len() <= 100);
         }
     }
+    #[test]
+    fn test_is_domain_allowed_exact() {
+        let mut set = HashSet::new();
+        set.insert("example.com".to_string());
+        assert!(is_domain_allowed(&set, "example.com"));
+        assert!(!is_domain_allowed(&set, "a.example.com"));
+    }
+
+    #[test]
+    fn test_is_domain_allowed_wildcard_subdomains() {
+        let mut set = HashSet::new();
+        set.insert("*.example.com".to_string());
+        assert!(is_domain_allowed(&set, "a.example.com"));
+        assert!(is_domain_allowed(&set, "a.b.example.com"));
+        assert!(!is_domain_allowed(&set, "example.com"));
+        assert!(!is_domain_allowed(&set, "badexample.com"));
+    }
+
+    #[test]
+    fn test_is_domain_allowed_leading_dot_suffix() {
+        let mut set = HashSet::new();
+        set.insert(".example.com".to_string());
+        assert!(is_domain_allowed(&set, "example.com"));
+        assert!(is_domain_allowed(&set, "a.example.com"));
+        assert!(!is_domain_allowed(&set, "badexample.com"));
+    }
+
+    #[test]
+    fn test_is_domain_allowed_any_wildcard() {
+        let mut set = HashSet::new();
+        set.insert("*".to_string());
+        assert!(is_domain_allowed(&set, "anything.com"));
+        assert!(is_domain_allowed(&set, "sub.domain"));
+    }
+
 }
