@@ -451,7 +451,6 @@ async fn proxy(
         }
     }
 
-    // Removed debug log for each request to reduce noise
     if let (Some(allowed_domains), Some(request_domain)) =
         (allowed_domains.as_ref(), req.uri().host())
     {
@@ -516,7 +515,6 @@ async fn proxy(
 
         let mut connection_guard = ConnectionGuard::new();
         let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-        // Removed debug log for HTTP connections to reduce noise
 
         // Multi-level warning system for high-capacity server
         if current_connections > MEMORY_PRESSURE_THRESHOLD {
@@ -600,7 +598,6 @@ async fn proxy(
             result = &mut request_future => {
                 match result {
                     Ok(resp) => {
-                        // Removed debug log for response timing to reduce noise
                         resp
                     },
                     Err(e) => {
@@ -640,7 +637,6 @@ async fn proxy(
             drop(connection_guard); // RAII drop -> decrement
         });
         // Intentionally do not abort conn_handle; it will finish when the connection shuts down.
-        // Removed debug log for connection closure to reduce noise
 
         // Return the response body as-is; hyper will forward it to the client
         Ok(resp.map(|b| b.boxed()))
@@ -725,7 +721,6 @@ async fn tunnel(
 
     let mut connection_guard = ConnectionGuard::new();
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-    // Removed debug log for tunnel connections to reduce noise
 
     let socks_stream = match auth.as_ref() {
         Some(auth) => {
@@ -823,8 +818,6 @@ async fn tunnel(
             }
         }
     }
-
-    // Removed debug log for tunnel completion to reduce noise
 
     if let Err(e) = server.shutdown().await {
         // Only log unexpected shutdown errors
