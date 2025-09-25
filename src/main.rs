@@ -185,9 +185,9 @@ struct Cli {
     #[command(flatten)]
     auth: Option<Auths>,
 
-    /// Socks5 proxy address
-    #[arg(short, long, default_value = "127.0.0.1:1080")]
-    socks_address: SocketAddr,
+    /// Socks5 proxy address or hostname:port
+    #[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
+    socks_address: String,
 
     /// Comma-separated list of allowed domains
     #[arg(long, value_delimiter = ',')]
@@ -221,7 +221,24 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    let socks_addr = args.socks_address;
+    let socks_ep = args.socks_address;
+    let socks_addr: SocketAddr = match tokio::net::lookup_host(&socks_ep).await {
+        Ok(mut it) => match it.next() {
+            Some(addr) => addr,
+            None => {
+                return Err(color_eyre::eyre::eyre!(format!(
+                    "No addresses found for {}",
+                    socks_ep
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(color_eyre::eyre::eyre!(format!(
+                "Failed to resolve {}: {}",
+                socks_ep, e
+            )));
+        }
+    };
     let port = args.port;
     let auth = args
         .auth
