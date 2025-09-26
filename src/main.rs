@@ -189,7 +189,40 @@ struct Cli {
     #[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
     socks_address: String,
 
+    /// Enable SOAX sticky session per client connection: 1 or 0
+    #[arg(long = "soax-sticky", value_parser = value_parser!(u8).range(0..=1), default_value_t = 0)]
+    soax_sticky: u8,
+
+    /// SOAX package id (required when --soax-sticky=1)
+    #[arg(long)]
+    soax_package_id: Option<String>,
+
+    /// SOAX GEO parameters (optional)
+    #[arg(long)]
+    soax_country: Option<String>,
+    #[arg(long)]
+    soax_region: Option<String>,
+    #[arg(long)]
+    soax_city: Option<String>,
+    #[arg(long)]
+    soax_isp: Option<String>,
+
+    /// SOAX sessionlength in seconds (only used when sticky is enabled)
+    #[arg(long, default_value_t = 360)]
+    soax_sessionlength: u32,
+
+    /// SOAX bindttl in seconds (optional)
+    #[arg(long)]
+    soax_bindttl: Option<u32>,
+
+    /// SOAX idlettl in seconds (optional)
+    #[arg(long)]
+    soax_idlettl: Option<u32>,
     /// Comma-separated list of allowed domains
+    /// SOAX opt flags (comma-separated, e.g., 'lookalike,uniqip')
+    #[arg(long = "soax-opt", value_delimiter = ',')]
+    soax_opt: Option<Vec<String>>,
+
     #[arg(long, value_delimiter = ',')]
     allowed_domains: Option<Vec<String>>,
 
@@ -211,6 +244,54 @@ struct Cli {
     /// Force 'Connection: close' on forwarded HTTP requests
     #[arg(long, default_value_t = true)]
     force_close: bool,
+}
+
+
+#[derive(Clone, Debug)]
+struct SoaxSettings {
+    enabled: bool,
+    package_id: Option<String>,
+    country: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    isp: Option<String>,
+    sessionlength: u32,
+    bindttl: Option<u32>,
+    idlettl: Option<u32>,
+    opts: Vec<String>,
+}
+
+impl SoaxSettings {
+    fn build_username(&self, sessionid: Option<&str>) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(16);
+        if let Some(pkg) = &self.package_id {
+            parts.push(format!("package-{}", pkg));
+        }
+        if let Some(c) = &self.country { parts.push(format!("country-{}", c)); }
+        if let Some(r) = &self.region { parts.push(format!("region-{}", r)); }
+        if let Some(ci) = &self.city { parts.push(format!("city-{}", ci)); }
+        if let Some(i) = &self.isp { parts.push(format!("isp-{}", i)); }
+
+        for opt in &self.opts { parts.push(format!("opt-{}", opt)); }
+
+        if let Some(sid) = sessionid {
+            parts.push(format!("sessionid-{}", sid));
+            // sessionlength only meaningful when sessionid is present
+            parts.push(format!("sessionlength-{}", self.sessionlength));
+            if let Some(b) = self.bindttl { parts.push(format!("bindttl-{}", b)); }
+            if let Some(i) = self.idlettl { parts.push(format!("idlettl-{}", i)); }
+        }
+        parts.join("-")
+    }
+}
+
+static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn new_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ctr = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // compact, URL-safe lowercase hex
+    format!("{:x}{:x}", now.as_nanos() & 0xffffffffffff, ctr & 0xffffffff)
 }
 
 #[tokio::main]
@@ -256,11 +337,38 @@ async fn main() -> Result<()> {
     let no_httpauth = args.no_httpauth == 1;
     let idle_timeout = args.idle_timeout;
     let conn_per_ip = args.conn_per_ip;
+
+
     let force_close = args.force_close;
 
     let listener = TcpListener::bind(addr).await?;
     info!("HTTP Proxy listening on http://{}", addr);
     info!("SOCKS5 backend: {}", socks_addr);
+
+
+    let soax_settings = Arc::new(SoaxSettings {
+        enabled: args.soax_sticky == 1,
+        package_id: args.soax_package_id.clone(),
+        country: args.soax_country.clone(),
+        region: args.soax_region.clone(),
+        city: args.soax_city.clone(),
+        isp: args.soax_isp.clone(),
+        sessionlength: args.soax_sessionlength,
+        bindttl: args.soax_bindttl,
+        idlettl: args.soax_idlettl,
+        opts: args.soax_opt.clone().unwrap_or_default(),
+    });
+
+    if soax_settings.enabled {
+        info!("SOAX sticky per-connection enabled; sessionlength={}s", soax_settings.sessionlength);
+        if soax_settings.package_id.is_none() {
+            warn!("--soax-package-id is required when --soax-sticky=1");
+        }
+        match auth.as_ref() {
+            Some(a) if !a.password.is_empty() => { /* ok */ }
+            _ => warn!("SOAX mode expects --auth password to be package_key (SOAX password)"),
+        }
+    }
 
     // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
@@ -373,8 +481,12 @@ async fn main() -> Result<()> {
                     let auth = auth.clone();
                     let http_basic = http_basic.clone();
                     let allowed_domains = allowed_domains.clone();
+                    let soax_settings = soax_settings.clone();
+                    let sessionid = if soax_settings.enabled { Some(new_session_id()) } else { None };
                     tokio::task::spawn(async move {
                         let io = TokioIo::new(stream);
+                        let sess = sessionid.clone();
+                        let soax_cfg = soax_settings.clone();
                         let service = service_fn(move |req| {
                             proxy(
                                 req,
@@ -385,6 +497,8 @@ async fn main() -> Result<()> {
                                 no_httpauth,
                                 idle_timeout,
                                 force_close,
+                                soax_cfg.clone(),
+                                sess.clone(),
                             )
                         });
 
@@ -436,6 +550,8 @@ async fn proxy(
     no_httpauth: bool,
     idle_timeout: u64,
     force_close: bool,
+    soax_settings: Arc<SoaxSettings>,
+    sessionid: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Early return for disabled authentication
     if no_httpauth {
@@ -491,7 +607,16 @@ async fn proxy(
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         let idle_timeout = idle_timeout;
-                        if let Err(e) = tunnel(upgraded, addr, socks_addr, auth, idle_timeout).await
+                        if let Err(e) = tunnel(
+                                upgraded,
+                                addr,
+                                socks_addr,
+                                auth,
+                                idle_timeout,
+                                soax_settings.clone(),
+                                sessionid.clone(),
+                            )
+                            .await
                         {
                             warn!("server io error: {}", e);
                         };
@@ -548,34 +673,65 @@ async fn proxy(
             info!("Moderate connection load: {}", current_connections);
         }
 
-        let socks_stream = match auth.as_ref() {
-            Some(auth) => {
-                match Socks5Stream::connect_with_password(
-                    socks_addr,
-                    addr.as_str(),
-                    &auth.username,
-                    &auth.password,
-                )
-                .await
-                {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
-                        let mut resp = Response::new(full("SOCKS5 authentication failed"));
-                        *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
-                        return Ok(resp);
-                    }
-                }
+        let socks_stream = if soax_settings.enabled {
+            // Build SOAX username with per-connection sessionid
+            let username = soax_settings.build_username(sessionid.as_deref());
+            let password = match auth.as_ref() {
+                Some(a) => a.password.clone(),
+                None => String::new(),
+            };
+            if password.is_empty() || soax_settings.package_id.is_none() {
+                warn!("SOAX mode requires --soax-package-id and --auth password (SOAX key)");
+                let mut resp = Response::new(full("SOCKS5 authentication failed"));
+                *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                return Ok(resp);
             }
-            None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
+            match Socks5Stream::connect_with_password(
+                socks_addr,
+                addr.as_str(),
+                &username,
+                &password,
+            )
+            .await
+            {
                 Ok(stream) => stream,
                 Err(e) => {
-                    warn!("SOCKS5 connection #{} failed: {}", conn_id, e);
-                    let mut resp = Response::new(full("SOCKS5 connection failed"));
+                    warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
+                    let mut resp = Response::new(full("SOCKS5 authentication failed"));
                     *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
                     return Ok(resp);
                 }
-            },
+            }
+        } else {
+            match auth.as_ref() {
+                Some(auth) => {
+                    match Socks5Stream::connect_with_password(
+                        socks_addr,
+                        addr.as_str(),
+                        &auth.username,
+                        &auth.password,
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
+                            let mut resp = Response::new(full("SOCKS5 authentication failed"));
+                            *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                            return Ok(resp);
+                        }
+                    }
+                }
+                None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!("SOCKS5 connection #{} failed: {}", conn_id, e);
+                        let mut resp = Response::new(full("SOCKS5 connection failed"));
+                        *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                        return Ok(resp);
+                    }
+                },
+            }
         };
 
         // Optionally force Connection: close for stability (prevents CLOSE_WAIT issues)
@@ -724,6 +880,8 @@ async fn tunnel(
     socks_addr: SocketAddr,
     auth: Arc<Option<Auth>>,
     idle_timeout: u64,
+    soax_settings: Arc<SoaxSettings>,
+    sessionid: Option<String>,
 ) -> Result<()> {
     // Check connection limits for stability
     let current_connections = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
@@ -739,31 +897,61 @@ async fn tunnel(
     let mut connection_guard = ConnectionGuard::new();
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
-    let socks_stream = match auth.as_ref() {
-        Some(auth) => {
-            match Socks5Stream::connect_with_password(
-                socks_addr,
-                addr.as_str(),
-                &auth.username,
-                &auth.password,
-            )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(e) => {
-                    return Err(color_eyre::eyre::eyre!(
-                        "SOCKS5 auth connection failed: {}",
-                        e
-                    ));
-                }
-            }
+    let socks_stream = if soax_settings.enabled {
+        // SOAX sticky per-connection: build dynamic username with sessionid
+        let username = soax_settings.build_username(sessionid.as_deref());
+        let password = match auth.as_ref() {
+            Some(a) => a.password.clone(),
+            None => String::new(),
+        };
+        if password.is_empty() || soax_settings.package_id.is_none() {
+            return Err(color_eyre::eyre::eyre!(
+                "SOAX mode requires --soax-package-id and --auth password (SOAX key)"
+            ));
         }
-        None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
+        match Socks5Stream::connect_with_password(
+            socks_addr,
+            addr.as_str(),
+            &username,
+            &password,
+        )
+        .await
+        {
             Ok(stream) => stream,
             Err(e) => {
-                return Err(color_eyre::eyre::eyre!("SOCKS5 connection failed: {}", e));
+                return Err(color_eyre::eyre::eyre!(
+                    "SOCKS5 auth connection failed: {}",
+                    e
+                ));
             }
-        },
+        }
+    } else {
+        match auth.as_ref() {
+            Some(auth) => {
+                match Socks5Stream::connect_with_password(
+                    socks_addr,
+                    addr.as_str(),
+                    &auth.username,
+                    &auth.password,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "SOCKS5 auth connection failed: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+            None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    return Err(color_eyre::eyre::eyre!("SOCKS5 connection failed: {}", e));
+                }
+            },
+        }
     };
 
     let mut client = TokioIo::new(upgraded);
