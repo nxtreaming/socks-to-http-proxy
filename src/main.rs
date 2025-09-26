@@ -160,16 +160,15 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 40000; // 40K concurent connection (~7
 const CONNECTION_BACKLOG_THRESHOLD: usize = 30000; // 30K warning threshold (~5.5GB)
 const MEMORY_PRESSURE_THRESHOLD: usize = 35000; // 35K memory threshold (~6.4GB)
 
-#[derive(Debug, Args)]
-#[group()]
+#[derive(Debug, Clone, Args)]
 struct Auths {
-    /// Socks5 username
-    #[arg(short = 'u', long, required = false)]
-    username: String,
+    /// Socks5 username (optional; not needed in --soax-sticky mode)
+    #[arg(short = 'u', long)]
+    username: Option<String>,
 
-    /// Socks5 password
-    #[arg(short = 'P', long, required = false)]
-    password: String,
+    /// Socks5 password (SOAX package_key in --soax-sticky mode)
+    #[arg(short = 'P', long)]
+    password: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -321,10 +320,16 @@ async fn main() -> Result<()> {
         }
     };
     let port = args.port;
+    let soax_password = Arc::new(args.auth.as_ref().and_then(|a| a.password.clone()));
     let auth = args
         .auth
-        .map(|auth| Auth::new(auth.username, auth.password));
+        .as_ref()
+        .and_then(|a| match (&a.username, &a.password) {
+            (Some(u), Some(p)) => Some(Auth::new(u.clone(), p.clone())),
+            _ => None,
+        });
     let auth = Arc::new(auth);
+    let soax_password = soax_password.clone();
     let addr = SocketAddr::from((args.listen_ip, port));
     let allowed_domains: Option<HashSet<String>> =
         args.allowed_domains.map(|v| v.into_iter().collect());
@@ -364,9 +369,9 @@ async fn main() -> Result<()> {
         if soax_settings.package_id.is_none() {
             warn!("--soax-package-id is required when --soax-sticky=1");
         }
-        match auth.as_ref() {
-            Some(a) if !a.password.is_empty() => { /* ok */ }
-            _ => warn!("SOAX mode expects --auth password to be package_key (SOAX password)"),
+        match soax_password.as_ref() {
+            Some(p) if !p.is_empty() => { /* ok */ }
+            _ => warn!("SOAX mode expects --auth -P <package_key> (SOAX password)"),
         }
     }
 
@@ -478,6 +483,7 @@ async fn main() -> Result<()> {
                         info!("High connection count for IP {}: {} connections", client_ip, new_count);
                     }
 
+                    let soax_password = soax_password.clone();
                     let auth = auth.clone();
                     let http_basic = http_basic.clone();
                     let allowed_domains = allowed_domains.clone();
@@ -497,6 +503,7 @@ async fn main() -> Result<()> {
                                 no_httpauth,
                                 idle_timeout,
                                 force_close,
+                                soax_password.clone(),
                                 soax_cfg.clone(),
                                 sess.clone(),
                             )
@@ -550,6 +557,7 @@ async fn proxy(
     no_httpauth: bool,
     idle_timeout: u64,
     force_close: bool,
+    soax_password: Arc<Option<String>>,
     soax_settings: Arc<SoaxSettings>,
     sessionid: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
@@ -603,6 +611,7 @@ async fn proxy(
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
             let auth = auth.clone();
+            let soax_password = soax_password.clone();
             tokio::task::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
@@ -613,6 +622,7 @@ async fn proxy(
                                 socks_addr,
                                 auth,
                                 idle_timeout,
+                                soax_password.clone(),
                                 soax_settings.clone(),
                                 sessionid.clone(),
                             )
@@ -676,10 +686,7 @@ async fn proxy(
         let socks_stream = if soax_settings.enabled {
             // Build SOAX username with per-connection sessionid
             let username = soax_settings.build_username(sessionid.as_deref());
-            let password = match auth.as_ref() {
-                Some(a) => a.password.clone(),
-                None => String::new(),
-            };
+            let password = soax_password.as_ref().clone().unwrap_or_default();
             if password.is_empty() || soax_settings.package_id.is_none() {
                 warn!("SOAX mode requires --soax-package-id and --auth password (SOAX key)");
                 let mut resp = Response::new(full("SOCKS5 authentication failed"));
@@ -880,6 +887,7 @@ async fn tunnel(
     socks_addr: SocketAddr,
     auth: Arc<Option<Auth>>,
     idle_timeout: u64,
+    soax_password: Arc<Option<String>>,
     soax_settings: Arc<SoaxSettings>,
     sessionid: Option<String>,
 ) -> Result<()> {
@@ -900,10 +908,7 @@ async fn tunnel(
     let socks_stream = if soax_settings.enabled {
         // SOAX sticky per-connection: build dynamic username with sessionid
         let username = soax_settings.build_username(sessionid.as_deref());
-        let password = match auth.as_ref() {
-            Some(a) => a.password.clone(),
-            None => String::new(),
-        };
+        let password = soax_password.as_ref().clone().unwrap_or_default();
         if password.is_empty() || soax_settings.package_id.is_none() {
             return Err(color_eyre::eyre::eyre!(
                 "SOAX mode requires --soax-package-id and --auth password (SOAX key)"
