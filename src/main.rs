@@ -8,9 +8,11 @@ mod socks;
 
 use crate::buffer_pool::{get_buffer, return_buffer};
 use crate::config::{Cli, ProxyConfig};
-use crate::connection::{ConnectionGuard, get_ip_tracker, is_connection_limit_exceeded,
-                       is_memory_pressure_high, is_backlog_threshold_exceeded,
-                       ACTIVE_SOCKS5_CONNECTIONS, CONNECTION_BACKLOG_THRESHOLD, MEMORY_PRESSURE_THRESHOLD};
+use crate::connection::{
+    get_ip_tracker, is_backlog_threshold_exceeded, is_connection_limit_exceeded,
+    is_memory_pressure_high, ConnectionGuard, ACTIVE_SOCKS5_CONNECTIONS,
+    CONNECTION_BACKLOG_THRESHOLD, MEMORY_PRESSURE_THRESHOLD,
+};
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
@@ -47,14 +49,21 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
 
     // Create proxy configuration from CLI arguments
-    let config = ProxyConfig::from_cli(args).await?;
+    let config = Arc::new(ProxyConfig::from_cli(args).await?);
 
     info!("HTTP Proxy listening on http://{}", config.listen_addr);
     info!("SOCKS5 backend: {}", config.socks_addr);
 
     if config.soax_settings.enabled {
-        info!("SOAX sticky per-connection enabled; sessionlength={}s", config.soax_settings.sessionlength);
+        info!(
+            "SOAX sticky per-connection enabled; sessionlength={}s",
+            config.soax_settings.sessionlength
+        );
     }
+
+    // Precompute shared auth/domain configuration to avoid per-connection cloning
+    let http_basic = Arc::new(config.http_basic_auth.clone());
+    let allowed_domains = Arc::new(config.allowed_domains.clone());
 
     // Create SOCKS5 connector
     let socks_connector = Arc::new(SocksConnector::new(
@@ -159,10 +168,14 @@ async fn main() -> Result<()> {
                     // Check per-IP connection limits
                     let ip_tracker = get_ip_tracker();
                     let client_ip = peer_addr.ip();
+                    let conn_limit = config.conn_per_ip;
                     let current_ip_connections = ip_tracker.get_count(client_ip);
 
-                    if current_ip_connections >= config.conn_per_ip {
-                        warn!("Connection limit exceeded for IP {}: {} connections", client_ip, current_ip_connections);
+                    if current_ip_connections >= conn_limit {
+                        warn!(
+                            "Connection limit exceeded for IP {}: {} connections",
+                            client_ip, current_ip_connections
+                        );
                         // Close the connection immediately
                         drop(stream);
                         continue;
@@ -170,15 +183,32 @@ async fn main() -> Result<()> {
 
                     // Increment connection count for this IP
                     let new_count = ip_tracker.increment(client_ip);
+                    if new_count > conn_limit {
+                        warn!(
+                            "Connection limit exceeded after increment for IP {}: {} connections",
+                            client_ip, new_count
+                        );
+                        ip_tracker.decrement(client_ip);
+                        drop(stream);
+                        continue;
+                    }
+
                     if new_count > 20 {
-                        info!("High connection count for IP {}: {} connections", client_ip, new_count);
+                        info!(
+                            "High connection count for IP {}: {} connections",
+                            client_ip, new_count
+                        );
                     }
 
                     let socks_connector = socks_connector.clone();
-                    let http_basic = Arc::new(config.http_basic_auth.clone());
-                    let allowed_domains = Arc::new(config.allowed_domains.clone());
-                    let sessionid = if config.soax_settings.enabled { Some(new_session_id()) } else { None };
-                    let config_clone = config.clone();
+                    let http_basic = http_basic.clone();
+                    let allowed_domains = allowed_domains.clone();
+                    let config = Arc::clone(&config);
+                    let sessionid = if config.soax_settings.enabled {
+                        Some(new_session_id())
+                    } else {
+                        None
+                    };
                     tokio::task::spawn(async move {
                         let io = TokioIo::new(stream);
                         let sess = sessionid.clone();
@@ -188,7 +218,7 @@ async fn main() -> Result<()> {
                                 socks_connector.clone(),
                                 http_basic.clone(),
                                 allowed_domains.clone(),
-                                config_clone.clone(),
+                                Arc::clone(&config),
                                 sess.clone(),
                             )
                         });
@@ -237,7 +267,7 @@ async fn proxy(
     socks_connector: Arc<SocksConnector>,
     http_basic: Arc<Option<HeaderValue>>,
     allowed_domains: Arc<Option<HashSet<String>>>,
-    config: ProxyConfig,
+    config: Arc<ProxyConfig>,
     sessionid: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Early return for disabled authentication
@@ -252,7 +282,9 @@ async fn proxy(
             None => {
                 // When the request does not contain a Proxy-Authorization header,
                 // send a 407 response with Proxy-Authenticate header
-                return Ok(proxy_auth_required_response("Proxy authentication required"));
+                return Ok(proxy_auth_required_response(
+                    "Proxy authentication required",
+                ));
             }
         };
 
@@ -261,12 +293,16 @@ async fn proxy(
             Some(expected_auth) => {
                 if auth_header != expected_auth {
                     warn!("Failed to authenticate: {:?}", headers);
-                    return Ok(proxy_auth_required_response("Proxy authentication required"));
+                    return Ok(proxy_auth_required_response(
+                        "Proxy authentication required",
+                    ));
                 }
             }
             None => {
                 warn!("HTTP Basic auth not configured but required");
-                return Ok(proxy_auth_required_response("Proxy authentication required"));
+                return Ok(proxy_auth_required_response(
+                    "Proxy authentication required",
+                ));
             }
         }
     }
@@ -292,7 +328,9 @@ async fn proxy(
             let socks_connector = socks_connector.clone();
             // HTTPS (CONNECT) domain filtering based on allowed_domains
             // For CONNECT, the request URI is authority-form (host:port). Use authority().host().
-            if let (Some(allowed), Some(authority)) = (allowed_domains.as_ref().as_ref(), req.uri().authority()) {
+            if let (Some(allowed), Some(authority)) =
+                (allowed_domains.as_ref().as_ref(), req.uri().authority())
+            {
                 let host = authority.host();
                 if !is_domain_allowed(allowed, host) {
                     warn!(
@@ -312,13 +350,13 @@ async fn proxy(
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         if let Err(e) = tunnel(
-                                upgraded,
-                                addr,
-                                socks_connector,
-                                idle_timeout,
-                                sessionid.clone(),
-                            )
-                            .await
+                            upgraded,
+                            addr,
+                            socks_connector,
+                            idle_timeout,
+                            sessionid.clone(),
+                        )
+                        .await
                         {
                             warn!("server io error: {}", e);
                         };
@@ -380,7 +418,10 @@ async fn proxy(
             }
         }
 
-        let socks_stream = match socks_connector.connect(addr.as_str(), sessionid.as_deref()).await {
+        let socks_stream = match socks_connector
+            .connect(addr.as_str(), sessionid.as_deref())
+            .await
+        {
             Ok(stream) => stream,
             Err(e) => {
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
@@ -485,9 +526,10 @@ fn empty() -> BoxBody<Bytes, hyper::Error> {
 fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut response = Response::new(full(msg));
     *response.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
-    response
-        .headers_mut()
-        .insert(PROXY_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"proxy\""));
+    response.headers_mut().insert(
+        PROXY_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"proxy\""),
+    );
     response
 }
 
@@ -518,10 +560,16 @@ async fn tunnel(
     let mut connection_guard = ConnectionGuard::new();
     let conn_id = ConnectionGuard::active_count();
 
-    let socks_stream = match socks_connector.connect(addr.as_str(), sessionid.as_deref()).await {
+    let socks_stream = match socks_connector
+        .connect(addr.as_str(), sessionid.as_deref())
+        .await
+    {
         Ok(stream) => stream,
         Err(e) => {
-            return Err(color_eyre::eyre::eyre!("Upstream SOCKS5 connection failed: {}", e));
+            return Err(color_eyre::eyre::eyre!(
+                "Upstream SOCKS5 connection failed: {}",
+                e
+            ));
         }
     };
 
@@ -634,9 +682,9 @@ async fn tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::header::HeaderValue;
     use base64::engine::general_purpose;
     use base64::Engine;
+    use hyper::header::HeaderValue;
 
     #[test]
     fn test_http_basic_auth_header_creation() {
