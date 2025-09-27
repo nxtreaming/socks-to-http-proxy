@@ -207,7 +207,7 @@ struct Cli {
     soax_isp: Option<String>,
 
     /// SOAX sessionlength in seconds (only used when sticky is enabled)
-    #[arg(long, default_value_t = 360)]
+    #[arg(long, default_value_t = 300)]
     soax_sessionlength: u32,
 
     /// SOAX bindttl in seconds (optional)
@@ -244,7 +244,6 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     force_close: bool,
 }
-
 
 #[derive(Clone, Debug)]
 struct SoaxSettings {
@@ -292,6 +291,36 @@ fn new_session_id() -> String {
     // compact, URL-safe lowercase hex
     format!("{:x}{:x}", now.as_nanos() & 0xffffffffffff, ctr & 0xffffffff)
 }
+
+async fn open_socks5_stream(
+    socks_addr: SocketAddr,
+    target_addr: &str,
+    auth: &Arc<Option<Auth>>,
+    soax_password: &Arc<Option<String>>,
+    soax_settings: &Arc<SoaxSettings>,
+    sessionid: Option<&str>,
+) -> std::result::Result<Socks5Stream<tokio::net::TcpStream>, String> {
+    if soax_settings.enabled {
+        let username = soax_settings.build_username(sessionid);
+        let password = soax_password.as_ref().clone().unwrap_or_default();
+        if password.is_empty() || soax_settings.package_id.is_none() {
+            return Err("SOAX mode requires --soax-package-id and --auth -P <package_key>".to_string());
+        }
+        Socks5Stream::connect_with_password(socks_addr, target_addr, &username, &password)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        match auth.as_ref() {
+            Some(a) => {
+                Socks5Stream::connect_with_password(socks_addr, target_addr, &a.username, &a.password)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            None => Socks5Stream::connect(socks_addr, target_addr).await.map_err(|e| e.to_string()),
+        }
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -343,13 +372,11 @@ async fn main() -> Result<()> {
     let idle_timeout = args.idle_timeout;
     let conn_per_ip = args.conn_per_ip;
 
-
     let force_close = args.force_close;
 
     let listener = TcpListener::bind(addr).await?;
     info!("HTTP Proxy listening on http://{}", addr);
     info!("SOCKS5 backend: {}", socks_addr);
-
 
     let soax_settings = Arc::new(SoaxSettings {
         enabled: args.soax_sticky == 1,
@@ -683,61 +710,22 @@ async fn proxy(
             info!("Moderate connection load: {}", current_connections);
         }
 
-        let socks_stream = if soax_settings.enabled {
-            // Build SOAX username with per-connection sessionid
-            let username = soax_settings.build_username(sessionid.as_deref());
-            let password = soax_password.as_ref().clone().unwrap_or_default();
-            if password.is_empty() || soax_settings.package_id.is_none() {
-                warn!("SOAX mode requires --soax-package-id and --auth password (SOAX key)");
-                let mut resp = Response::new(full("SOCKS5 authentication failed"));
+        let socks_stream = match open_socks5_stream(
+            socks_addr,
+            addr.as_str(),
+            &auth,
+            &soax_password,
+            &soax_settings,
+            sessionid.as_deref(),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
+                let mut resp = Response::new(full("SOCKS5 connection failed"));
                 *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
                 return Ok(resp);
-            }
-            match Socks5Stream::connect_with_password(
-                socks_addr,
-                addr.as_str(),
-                &username,
-                &password,
-            )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
-                    let mut resp = Response::new(full("SOCKS5 authentication failed"));
-                    *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
-                    return Ok(resp);
-                }
-            }
-        } else {
-            match auth.as_ref() {
-                Some(auth) => {
-                    match Socks5Stream::connect_with_password(
-                        socks_addr,
-                        addr.as_str(),
-                        &auth.username,
-                        &auth.password,
-                    )
-                    .await
-                    {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            warn!("SOCKS5 auth connection #{} failed: {}", conn_id, e);
-                            let mut resp = Response::new(full("SOCKS5 authentication failed"));
-                            *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
-                            return Ok(resp);
-                        }
-                    }
-                }
-                None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!("SOCKS5 connection #{} failed: {}", conn_id, e);
-                        let mut resp = Response::new(full("SOCKS5 connection failed"));
-                        *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
-                        return Ok(resp);
-                    }
-                },
             }
         };
 
@@ -905,59 +893,22 @@ async fn tunnel(
     let mut connection_guard = ConnectionGuard::new();
     let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
-    let socks_stream = if soax_settings.enabled {
-        // SOAX sticky per-connection: build dynamic username with sessionid
-        let username = soax_settings.build_username(sessionid.as_deref());
-        let password = soax_password.as_ref().clone().unwrap_or_default();
-        if password.is_empty() || soax_settings.package_id.is_none() {
-            return Err(color_eyre::eyre::eyre!(
-                "SOAX mode requires --soax-package-id and --auth password (SOAX key)"
-            ));
-        }
-        match Socks5Stream::connect_with_password(
-            socks_addr,
-            addr.as_str(),
-            &username,
-            &password,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "SOCKS5 auth connection failed: {}",
-                    e
-                ));
-            }
-        }
-    } else {
-        match auth.as_ref() {
-            Some(auth) => {
-                match Socks5Stream::connect_with_password(
-                    socks_addr,
-                    addr.as_str(),
-                    &auth.username,
-                    &auth.password,
-                )
-                .await
-                {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        return Err(color_eyre::eyre::eyre!(
-                            "SOCKS5 auth connection failed: {}",
-                            e
-                        ));
-                    }
+    let socks_stream = match open_socks5_stream(
+        socks_addr,
+        addr.as_str(),
+        &auth,
+        &soax_password,
+        &soax_settings,
+        sessionid.as_deref(),
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return Err(color_eyre::eyre::eyre!("Upstream SOCKS5 connection failed: {}", e));
                 }
-            }
-            None => match Socks5Stream::connect(socks_addr, addr.as_str()).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    return Err(color_eyre::eyre::eyre!("SOCKS5 connection failed: {}", e));
-                }
-            },
-        }
     };
+
 
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
