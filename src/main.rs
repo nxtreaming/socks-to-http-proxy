@@ -321,7 +321,6 @@ async fn open_socks5_stream(
     }
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=warn"));
@@ -908,7 +907,6 @@ async fn tunnel(
             return Err(color_eyre::eyre::eyre!("Upstream SOCKS5 connection failed: {}", e));
                 }
     };
-
 
     let mut client = TokioIo::new(upgraded);
     let mut server = socks_stream;
