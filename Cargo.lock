@@ -590,6 +590,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "thiserror",
  "tokio",
  "tokio-socks",
  "tracing",

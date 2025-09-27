@@ -1,22 +1,31 @@
 mod auth;
+mod buffer_pool;
+mod config;
+mod connection;
+mod domain;
+mod session;
+mod socks;
 
-use crate::auth::Auth;
-use clap::{value_parser, Args, Parser};
+use crate::buffer_pool::{get_buffer, return_buffer};
+use crate::config::{Cli, ProxyConfig};
+use crate::connection::{ConnectionGuard, get_ip_tracker, is_connection_limit_exceeded,
+                       is_memory_pressure_high, is_backlog_threshold_exceeded,
+                       ACTIVE_SOCKS5_CONNECTIONS, CONNECTION_BACKLOG_THRESHOLD, MEMORY_PRESSURE_THRESHOLD};
+use crate::domain::is_domain_allowed;
+use crate::session::new_session_id;
+use crate::socks::SocksConnector;
+use clap::Parser;
 use color_eyre::eyre::Result;
 
-use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 
-use base64::engine::general_purpose;
-use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::Builder;
@@ -29,298 +38,6 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-// RAII guard to ensure connection count is properly decremented
-struct ConnectionGuard {
-    decremented: bool,
-}
-
-impl ConnectionGuard {
-    fn new() -> Self {
-        ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-        Self { decremented: false }
-    }
-
-    fn decrement(&mut self) {
-        if !self.decremented {
-            ACTIVE_SOCKS5_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-            self.decremented = true;
-        }
-    }
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.decrement();
-    }
-}
-
-// Buffer pool for memory optimization
-struct BufferPool {
-    small_buffers: Mutex<Vec<Vec<u8>>>, // 8KB buffers
-    large_buffers: Mutex<Vec<Vec<u8>>>, // 16KB buffers
-}
-
-impl BufferPool {
-    fn new() -> Self {
-        Self {
-            small_buffers: Mutex::new(Vec::new()),
-            large_buffers: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn get_buffer(&self, large: bool) -> Vec<u8> {
-        let size = if large { 16384 } else { 8192 };
-        let pool = if large {
-            &self.large_buffers
-        } else {
-            &self.small_buffers
-        };
-
-        if let Ok(mut buffers) = pool.lock() {
-            if let Some(mut buffer) = buffers.pop() {
-                buffer.clear();
-                buffer.resize(size, 0);
-                return buffer;
-            }
-        }
-
-        // Create new buffer if pool is empty
-        vec![0u8; size]
-    }
-
-    fn return_buffer(&self, buffer: Vec<u8>, large: bool) {
-        // Only return buffers that are the expected size to avoid memory bloat
-        let expected_size = if large { 16384 } else { 8192 };
-        if buffer.len() != expected_size {
-            return;
-        }
-
-        let pool = if large {
-            &self.large_buffers
-        } else {
-            &self.small_buffers
-        };
-        if let Ok(mut buffers) = pool.lock() {
-            // Limit pool size to prevent excessive memory usage
-            if buffers.len() < 100 {
-                buffers.push(buffer);
-            }
-        }
-    }
-}
-
-// Global buffer pool
-static BUFFER_POOL: std::sync::OnceLock<BufferPool> = std::sync::OnceLock::new();
-
-// Per-IP connection tracking
-struct IpConnectionTracker {
-    connections: Mutex<HashMap<IpAddr, usize>>,
-}
-
-impl IpConnectionTracker {
-    fn new() -> Self {
-        Self {
-            connections: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn increment(&self, ip: IpAddr) -> usize {
-        let mut connections = self.connections.lock().unwrap();
-        let count = connections.entry(ip).or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    fn decrement(&self, ip: IpAddr) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(count) = connections.get_mut(&ip) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                connections.remove(&ip);
-            }
-        }
-    }
-
-    fn get_count(&self, ip: IpAddr) -> usize {
-        let connections = self.connections.lock().unwrap();
-        connections.get(&ip).copied().unwrap_or(0)
-    }
-}
-
-// Global IP connection tracker
-static IP_TRACKER: std::sync::OnceLock<IpConnectionTracker> = std::sync::OnceLock::new();
-
-// Global counter for tracking active SOCKS5 connections
-static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-
-// Connection pool limits for multi-instance deployment on 16GB server
-const MAX_CONCURRENT_CONNECTIONS: usize = 40000; // 40K concurent connection (~7.4GB per instance)
-const CONNECTION_BACKLOG_THRESHOLD: usize = 30000; // 30K warning threshold (~5.5GB)
-const MEMORY_PRESSURE_THRESHOLD: usize = 35000; // 35K memory threshold (~6.4GB)
-
-#[derive(Debug, Clone, Args)]
-struct Auths {
-    /// Socks5 username (optional; not needed in --soax-sticky mode)
-    #[arg(short = 'u', long)]
-    username: Option<String>,
-
-    /// Socks5 password (SOAX package_key in --soax-sticky mode)
-    #[arg(short = 'P', long)]
-    password: Option<String>,
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about,long_about=None)]
-struct Cli {
-    /// port where Http proxy should listen
-    #[arg(short, long, default_value_t = 8080)]
-    port: u16,
-
-    #[arg(long, default_value = "0.0.0.0")]
-    listen_ip: Ipv4Addr,
-
-    #[command(flatten)]
-    auth: Option<Auths>,
-
-    /// Socks5 proxy address or hostname:port
-    #[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
-    socks_address: String,
-
-    /// Enable SOAX sticky session per client connection: 1 or 0
-    #[arg(long = "soax-sticky", value_parser = value_parser!(u8).range(0..=1), default_value_t = 0)]
-    soax_sticky: u8,
-
-    /// SOAX package id (required when --soax-sticky=1)
-    #[arg(long)]
-    soax_package_id: Option<String>,
-
-    /// SOAX GEO parameters (optional)
-    #[arg(long)]
-    soax_country: Option<String>,
-    #[arg(long)]
-    soax_region: Option<String>,
-    #[arg(long)]
-    soax_city: Option<String>,
-    #[arg(long)]
-    soax_isp: Option<String>,
-
-    /// SOAX sessionlength in seconds (only used when sticky is enabled)
-    #[arg(long, default_value_t = 300)]
-    soax_sessionlength: u32,
-
-    /// SOAX bindttl in seconds (optional)
-    #[arg(long)]
-    soax_bindttl: Option<u32>,
-
-    /// SOAX idlettl in seconds (optional)
-    #[arg(long)]
-    soax_idlettl: Option<u32>,
-    /// Comma-separated list of allowed domains
-    /// SOAX opt flags (comma-separated, e.g., 'lookalike,uniqip')
-    #[arg(long = "soax-opt", value_delimiter = ',')]
-    soax_opt: Option<Vec<String>>,
-
-    #[arg(long, value_delimiter = ',')]
-    allowed_domains: Option<Vec<String>>,
-
-    /// HTTP Basic Auth credentials in the format "user:passwd"
-    #[arg(long)]
-    http_basic: Option<String>,
-
-    /// Disable HTTP authentication：1 or 0
-    #[arg(long, value_parser = value_parser ! (u8).range(0..=1), default_value_t = 1)]
-    no_httpauth: u8,
-
-    /// Idle timeout in seconds for tunnel connections
-    #[arg(long, default_value_t = 540)]
-    idle_timeout: u64,
-
-    /// Maximum connections per IP address
-    #[arg(long = "conn-per-ip", default_value_t = 500)]
-    conn_per_ip: usize,
-    /// Force 'Connection: close' on forwarded HTTP requests
-    #[arg(long, default_value_t = true)]
-    force_close: bool,
-}
-
-#[derive(Clone, Debug)]
-struct SoaxSettings {
-    enabled: bool,
-    package_id: Option<String>,
-    country: Option<String>,
-    region: Option<String>,
-    city: Option<String>,
-    isp: Option<String>,
-    sessionlength: u32,
-    bindttl: Option<u32>,
-    idlettl: Option<u32>,
-    opts: Vec<String>,
-}
-
-impl SoaxSettings {
-    fn build_username(&self, sessionid: Option<&str>) -> String {
-        let mut parts: Vec<String> = Vec::with_capacity(16);
-        if let Some(pkg) = &self.package_id {
-            parts.push(format!("package-{}", pkg));
-        }
-        if let Some(c) = &self.country { parts.push(format!("country-{}", c)); }
-        if let Some(r) = &self.region { parts.push(format!("region-{}", r)); }
-        if let Some(ci) = &self.city { parts.push(format!("city-{}", ci)); }
-        if let Some(i) = &self.isp { parts.push(format!("isp-{}", i)); }
-
-        for opt in &self.opts { parts.push(format!("opt-{}", opt)); }
-
-        if let Some(sid) = sessionid {
-            parts.push(format!("sessionid-{}", sid));
-            // sessionlength only meaningful when sessionid is present
-            parts.push(format!("sessionlength-{}", self.sessionlength));
-            if let Some(b) = self.bindttl { parts.push(format!("bindttl-{}", b)); }
-            if let Some(i) = self.idlettl { parts.push(format!("idlettl-{}", i)); }
-        }
-        parts.join("-")
-    }
-}
-
-static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-fn new_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let ctr = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // compact, URL-safe lowercase hex
-    format!("{:x}{:x}", now.as_nanos() & 0xffffffffffff, ctr & 0xffffffff)
-}
-
-async fn open_socks5_stream(
-    socks_addr: SocketAddr,
-    target_addr: &str,
-    auth: &Arc<Option<Auth>>,
-    soax_password: &Arc<Option<String>>,
-    soax_settings: &Arc<SoaxSettings>,
-    sessionid: Option<&str>,
-) -> std::result::Result<Socks5Stream<tokio::net::TcpStream>, String> {
-    if soax_settings.enabled {
-        let username = soax_settings.build_username(sessionid);
-        let password = soax_password.as_ref().clone().unwrap_or_default();
-        if password.is_empty() || soax_settings.package_id.is_none() {
-            return Err("SOAX mode requires --soax-package-id and --auth -P <package_key>".to_string());
-        }
-        Socks5Stream::connect_with_password(socks_addr, target_addr, &username, &password)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        match auth.as_ref() {
-            Some(a) => {
-                Socks5Stream::connect_with_password(socks_addr, target_addr, &a.username, &a.password)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-            None => Socks5Stream::connect(socks_addr, target_addr).await.map_err(|e| e.to_string()),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=warn"));
@@ -329,77 +46,25 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    let socks_ep = args.socks_address;
-    let socks_addr: SocketAddr = match tokio::net::lookup_host(&socks_ep).await {
-        Ok(mut it) => match it.next() {
-            Some(addr) => addr,
-            None => {
-                return Err(color_eyre::eyre::eyre!(format!(
-                    "No addresses found for {}",
-                    socks_ep
-                )));
-            }
-        },
-        Err(e) => {
-            return Err(color_eyre::eyre::eyre!(format!(
-                "Failed to resolve {}: {}",
-                socks_ep, e
-            )));
-        }
-    };
-    let port = args.port;
-    let soax_password = Arc::new(args.auth.as_ref().and_then(|a| a.password.clone()));
-    let auth = args
-        .auth
-        .as_ref()
-        .and_then(|a| match (&a.username, &a.password) {
-            (Some(u), Some(p)) => Some(Auth::new(u.clone(), p.clone())),
-            _ => None,
-        });
-    let auth = Arc::new(auth);
-    let soax_password = soax_password.clone();
-    let addr = SocketAddr::from((args.listen_ip, port));
-    let allowed_domains: Option<HashSet<String>> =
-        args.allowed_domains.map(|v| v.into_iter().collect());
-    let allowed_domains = Arc::new(allowed_domains);
-    let http_basic = args
-        .http_basic
-        .map(|hb| format!("Basic {}", general_purpose::STANDARD.encode(hb)))
-        .map(|auth_str| HeaderValue::from_str(&auth_str).expect("Invalid HTTP Basic auth string"));
-    let http_basic = Arc::new(http_basic);
-    let no_httpauth = args.no_httpauth == 1;
-    let idle_timeout = args.idle_timeout;
-    let conn_per_ip = args.conn_per_ip;
+    // Create proxy configuration from CLI arguments
+    let config = ProxyConfig::from_cli(args).await?;
 
-    let force_close = args.force_close;
+    info!("HTTP Proxy listening on http://{}", config.listen_addr);
+    info!("SOCKS5 backend: {}", config.socks_addr);
 
-    let listener = TcpListener::bind(addr).await?;
-    info!("HTTP Proxy listening on http://{}", addr);
-    info!("SOCKS5 backend: {}", socks_addr);
-
-    let soax_settings = Arc::new(SoaxSettings {
-        enabled: args.soax_sticky == 1,
-        package_id: args.soax_package_id.clone(),
-        country: args.soax_country.clone(),
-        region: args.soax_region.clone(),
-        city: args.soax_city.clone(),
-        isp: args.soax_isp.clone(),
-        sessionlength: args.soax_sessionlength,
-        bindttl: args.soax_bindttl,
-        idlettl: args.soax_idlettl,
-        opts: args.soax_opt.clone().unwrap_or_default(),
-    });
-
-    if soax_settings.enabled {
-        info!("SOAX sticky per-connection enabled; sessionlength={}s", soax_settings.sessionlength);
-        if soax_settings.package_id.is_none() {
-            warn!("--soax-package-id is required when --soax-sticky=1");
-        }
-        match soax_password.as_ref() {
-            Some(p) if !p.is_empty() => { /* ok */ }
-            _ => warn!("SOAX mode expects --auth -P <package_key> (SOAX password)"),
-        }
+    if config.soax_settings.enabled {
+        info!("SOAX sticky per-connection enabled; sessionlength={}s", config.soax_settings.sessionlength);
     }
+
+    // Create SOCKS5 connector
+    let socks_connector = Arc::new(SocksConnector::new(
+        config.socks_addr,
+        Arc::new(config.socks_auth.clone()),
+        Arc::new(config.soax_password.clone()),
+        Arc::new(config.soax_settings.clone()),
+    ));
+
+    let listener = TcpListener::bind(config.listen_addr).await?;
 
     // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
@@ -492,11 +157,11 @@ async fn main() -> Result<()> {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     // Check per-IP connection limits
-                    let ip_tracker = IP_TRACKER.get_or_init(|| IpConnectionTracker::new());
+                    let ip_tracker = get_ip_tracker();
                     let client_ip = peer_addr.ip();
                     let current_ip_connections = ip_tracker.get_count(client_ip);
 
-                    if current_ip_connections >= conn_per_ip {
+                    if current_ip_connections >= config.conn_per_ip {
                         warn!("Connection limit exceeded for IP {}: {} connections", client_ip, current_ip_connections);
                         // Close the connection immediately
                         drop(stream);
@@ -509,28 +174,21 @@ async fn main() -> Result<()> {
                         info!("High connection count for IP {}: {} connections", client_ip, new_count);
                     }
 
-                    let soax_password = soax_password.clone();
-                    let auth = auth.clone();
-                    let http_basic = http_basic.clone();
-                    let allowed_domains = allowed_domains.clone();
-                    let soax_settings = soax_settings.clone();
-                    let sessionid = if soax_settings.enabled { Some(new_session_id()) } else { None };
+                    let socks_connector = socks_connector.clone();
+                    let http_basic = Arc::new(config.http_basic_auth.clone());
+                    let allowed_domains = Arc::new(config.allowed_domains.clone());
+                    let sessionid = if config.soax_settings.enabled { Some(new_session_id()) } else { None };
+                    let config_clone = config.clone();
                     tokio::task::spawn(async move {
                         let io = TokioIo::new(stream);
                         let sess = sessionid.clone();
-                        let soax_cfg = soax_settings.clone();
                         let service = service_fn(move |req| {
                             proxy(
                                 req,
-                                socks_addr,
-                                auth.clone(),
+                                socks_connector.clone(),
                                 http_basic.clone(),
                                 allowed_domains.clone(),
-                                no_httpauth,
-                                idle_timeout,
-                                force_close,
-                                soax_password.clone(),
-                                soax_cfg.clone(),
+                                config_clone.clone(),
                                 sess.clone(),
                             )
                         });
@@ -576,19 +234,14 @@ async fn main() -> Result<()> {
 
 async fn proxy(
     req: Request<hyper::body::Incoming>,
-    socks_addr: SocketAddr,
-    auth: Arc<Option<Auth>>,
+    socks_connector: Arc<SocksConnector>,
     http_basic: Arc<Option<HeaderValue>>,
     allowed_domains: Arc<Option<HashSet<String>>>,
-    no_httpauth: bool,
-    idle_timeout: u64,
-    force_close: bool,
-    soax_password: Arc<Option<String>>,
-    soax_settings: Arc<SoaxSettings>,
+    config: ProxyConfig,
     sessionid: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Early return for disabled authentication
-    if no_httpauth {
+    if config.no_httpauth {
         // Authentication is disabled, proceed
     } else {
         let headers = req.headers();
@@ -636,20 +289,33 @@ async fn proxy(
 
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
-            let auth = auth.clone();
-            let soax_password = soax_password.clone();
+            let socks_connector = socks_connector.clone();
+            // HTTPS (CONNECT) domain filtering based on allowed_domains
+            // For CONNECT, the request URI is authority-form (host:port). Use authority().host().
+            if let (Some(allowed), Some(authority)) = (allowed_domains.as_ref().as_ref(), req.uri().authority()) {
+                let host = authority.host();
+                if !is_domain_allowed(allowed, host) {
+                    warn!(
+                        "Access to domain {} is not allowed through the proxy (CONNECT).",
+                        host
+                    );
+                    let mut resp = Response::new(full(
+                        "Access to this domain is not allowed through the proxy.",
+                    ));
+                    *resp.status_mut() = http::StatusCode::FORBIDDEN;
+                    return Ok(resp);
+                }
+            }
+
+            let idle_timeout = config.idle_timeout;
             tokio::task::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        let idle_timeout = idle_timeout;
                         if let Err(e) = tunnel(
                                 upgraded,
                                 addr,
-                                socks_addr,
-                                auth,
+                                socks_connector,
                                 idle_timeout,
-                                soax_password.clone(),
-                                soax_settings.clone(),
                                 sessionid.clone(),
                             )
                             .await
@@ -683,8 +349,8 @@ async fn proxy(
         let addr = format!("{}:{}", host, port);
 
         // Check connection limits for stability
-        let current_connections = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-        if current_connections >= MAX_CONCURRENT_CONNECTIONS {
+        if is_connection_limit_exceeded() {
+            let current_connections = ConnectionGuard::active_count();
             warn!("Connection limit reached: {}", current_connections);
             let mut resp = Response::new(full("Server overloaded, please try again later"));
             *resp.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
@@ -692,33 +358,29 @@ async fn proxy(
         }
 
         let mut connection_guard = ConnectionGuard::new();
-        let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+        let conn_id = ConnectionGuard::active_count();
 
         // Multi-level warning system for high-capacity server
-        if current_connections > MEMORY_PRESSURE_THRESHOLD {
+        if is_memory_pressure_high() {
+            let current_connections = ConnectionGuard::active_count();
             error!(
                 "Critical connection count: {} (memory pressure threshold: {})",
                 current_connections, MEMORY_PRESSURE_THRESHOLD
             );
-        } else if current_connections > CONNECTION_BACKLOG_THRESHOLD {
+        } else if is_backlog_threshold_exceeded() {
+            let current_connections = ConnectionGuard::active_count();
             warn!(
                 "High connection count: {} (threshold: {})",
                 current_connections, CONNECTION_BACKLOG_THRESHOLD
             );
-        } else if current_connections > 20000 {
-            info!("Moderate connection load: {}", current_connections);
+        } else {
+            let current_connections = ConnectionGuard::active_count();
+            if current_connections > 20000 {
+                info!("Moderate connection load: {}", current_connections);
+            }
         }
 
-        let socks_stream = match open_socks5_stream(
-            socks_addr,
-            addr.as_str(),
-            &auth,
-            &soax_password,
-            &soax_settings,
-            sessionid.as_deref(),
-        )
-        .await
-        {
+        let socks_stream = match socks_connector.connect(addr.as_str(), sessionid.as_deref()).await {
             Ok(stream) => stream,
             Err(e) => {
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
@@ -731,7 +393,7 @@ async fn proxy(
         // Optionally force Connection: close for stability (prevents CLOSE_WAIT issues)
         // This trades some performance for better connection management
         let mut req = req;
-        if force_close {
+        if config.force_close {
             req.headers_mut()
                 .insert("connection", HeaderValue::from_static("close"));
         }
@@ -755,7 +417,7 @@ async fn proxy(
         });
 
         // Apply idle timeout with activity monitoring for HTTP requests
-        let timeout_duration = tokio::time::Duration::from_secs(idle_timeout);
+        let timeout_duration = tokio::time::Duration::from_secs(config.idle_timeout);
         let idle_timer = tokio::time::sleep(timeout_duration);
         tokio::pin!(idle_timer);
 
@@ -770,7 +432,7 @@ async fn proxy(
                     Err(e) => {
                         conn_handle.abort();
                         connection_guard.decrement();
-                        let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+                        let remaining = ConnectionGuard::active_count();
                         warn!("HTTP #{} connection error, {} active", conn_id, remaining);
                         return Err(e);
                     }
@@ -780,7 +442,7 @@ async fn proxy(
                 // Timeout reached - abort the connection
                 conn_handle.abort();
                 connection_guard.decrement();
-                let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+                let remaining = ConnectionGuard::active_count();
                 warn!(
                     "HTTP #{} timeout after {:?}, {} active",
                     conn_id, timeout_duration, remaining
@@ -814,39 +476,6 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().map(|auth| auth.to_string())
 }
 
-fn is_domain_allowed(allowed: &std::collections::HashSet<String>, host: &str) -> bool {
-    if allowed.contains("*") {
-        return true;
-    }
-    if allowed.contains(host) {
-        return true;
-    }
-    for pat in allowed {
-        if let Some(suffix) = pat.strip_prefix("*.") {
-            // Match any subdomain of suffix (but not the apex)
-            if host.ends_with(suffix) {
-
-
-                // Ensure there is a dot boundary before suffix
-                if host.len() > suffix.len() && host.as_bytes()[host.len() - suffix.len() - 1] == b'.' {
-                    return true;
-                }
-            }
-        } else if let Some(suffix) = pat.strip_prefix('.') {
-            // Match apex or any subdomain of suffix
-            if host == suffix {
-                return true;
-            }
-            if host.ends_with(suffix) {
-                if host.len() > suffix.len() && host.as_bytes()[host.len() - suffix.len() - 1] == b'.' {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn empty() -> BoxBody<Bytes, hyper::Error> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -871,16 +500,13 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 async fn tunnel(
     upgraded: Upgraded,
     addr: String,
-    socks_addr: SocketAddr,
-    auth: Arc<Option<Auth>>,
+    socks_connector: Arc<SocksConnector>,
     idle_timeout: u64,
-    soax_password: Arc<Option<String>>,
-    soax_settings: Arc<SoaxSettings>,
     sessionid: Option<String>,
 ) -> Result<()> {
     // Check connection limits for stability
-    let current_connections = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
-    if current_connections >= MAX_CONCURRENT_CONNECTIONS {
+    if is_connection_limit_exceeded() {
+        let current_connections = ConnectionGuard::active_count();
         warn!("Tunnel connection limit reached: {}", current_connections);
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
@@ -890,22 +516,13 @@ async fn tunnel(
     }
 
     let mut connection_guard = ConnectionGuard::new();
-    let conn_id = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+    let conn_id = ConnectionGuard::active_count();
 
-    let socks_stream = match open_socks5_stream(
-        socks_addr,
-        addr.as_str(),
-        &auth,
-        &soax_password,
-        &soax_settings,
-        sessionid.as_deref(),
-    )
-    .await
-    {
+    let socks_stream = match socks_connector.connect(addr.as_str(), sessionid.as_deref()).await {
         Ok(stream) => stream,
         Err(e) => {
             return Err(color_eyre::eyre::eyre!("Upstream SOCKS5 connection failed: {}", e));
-                }
+        }
     };
 
     let mut client = TokioIo::new(upgraded);
@@ -917,10 +534,9 @@ async fn tunnel(
     let mut from_server = 0u64;
 
     // Use buffer pool for memory optimization
-    let buffer_pool = BUFFER_POOL.get_or_init(BufferPool::new);
     let use_large_buffers = idle_timeout > 300;
-    let mut client_buf = buffer_pool.get_buffer(use_large_buffers);
-    let mut server_buf = buffer_pool.get_buffer(use_large_buffers);
+    let mut client_buf = get_buffer(use_large_buffers);
+    let mut server_buf = get_buffer(use_large_buffers);
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
     let mut error: Option<color_eyre::eyre::Error> = None;
@@ -995,11 +611,11 @@ async fn tunnel(
     drop(client);
 
     // Return buffers to pool for reuse
-    buffer_pool.return_buffer(client_buf, use_large_buffers);
-    buffer_pool.return_buffer(server_buf, use_large_buffers);
+    return_buffer(client_buf, use_large_buffers);
+    return_buffer(server_buf, use_large_buffers);
 
     connection_guard.decrement();
-    let remaining = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+    let remaining = ConnectionGuard::active_count();
 
     // Only log stats for very large transfers to reduce noise
     if from_client + from_server > 10_485_760 {
@@ -1019,6 +635,8 @@ async fn tunnel(
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
+    use base64::engine::general_purpose;
+    use base64::Engine;
 
     #[test]
     fn test_http_basic_auth_header_creation() {
@@ -1091,115 +709,4 @@ mod tests {
         // HashSet should be significantly faster for large datasets
         assert!(hashset_duration < vec_duration);
     }
-
-    #[test]
-    fn test_connection_guard() {
-        // Reset counter for test
-        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
-
-        {
-            let _guard = ConnectionGuard::new();
-            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 1);
-        }
-
-        // Guard should automatically decrement on drop
-        assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_connection_guard_manual_decrement() {
-        // Reset counter for test
-        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
-
-        {
-            let mut guard = ConnectionGuard::new();
-            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 1);
-
-            guard.decrement();
-            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
-
-            // Second decrement should be no-op
-            guard.decrement();
-            assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
-        }
-
-        // Drop should not decrement again
-        assert_eq!(ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_buffer_pool() {
-        let pool = BufferPool::new();
-
-        // Test small buffer
-        let small_buf = pool.get_buffer(false);
-        assert_eq!(small_buf.len(), 8192);
-
-        // Test large buffer
-        let large_buf = pool.get_buffer(true);
-        assert_eq!(large_buf.len(), 16384);
-
-        // Return buffers
-        pool.return_buffer(small_buf, false);
-        pool.return_buffer(large_buf, true);
-
-        // Get buffers again - should reuse from pool
-        let reused_small = pool.get_buffer(false);
-        let reused_large = pool.get_buffer(true);
-
-        assert_eq!(reused_small.len(), 8192);
-        assert_eq!(reused_large.len(), 16384);
-    }
-
-    #[test]
-    fn test_buffer_pool_size_limit() {
-        let pool = BufferPool::new();
-
-        // Fill pool beyond limit
-        for _ in 0..150 {
-            let buf = pool.get_buffer(false);
-            pool.return_buffer(buf, false);
-        }
-
-        // Pool should limit size to prevent memory bloat
-        {
-            let buffers = pool.small_buffers.lock().unwrap();
-            assert!(buffers.len() <= 100);
-        }
-    }
-    #[test]
-    fn test_is_domain_allowed_exact() {
-        let mut set = HashSet::new();
-        set.insert("example.com".to_string());
-        assert!(is_domain_allowed(&set, "example.com"));
-        assert!(!is_domain_allowed(&set, "a.example.com"));
-    }
-
-    #[test]
-    fn test_is_domain_allowed_wildcard_subdomains() {
-        let mut set = HashSet::new();
-        set.insert("*.example.com".to_string());
-        assert!(is_domain_allowed(&set, "a.example.com"));
-        assert!(is_domain_allowed(&set, "a.b.example.com"));
-        assert!(!is_domain_allowed(&set, "example.com"));
-        assert!(!is_domain_allowed(&set, "badexample.com"));
-    }
-
-    #[test]
-    fn test_is_domain_allowed_leading_dot_suffix() {
-        let mut set = HashSet::new();
-        set.insert(".example.com".to_string());
-        assert!(is_domain_allowed(&set, "example.com"));
-        assert!(is_domain_allowed(&set, "a.example.com"));
-        assert!(!is_domain_allowed(&set, "badexample.com"));
-    }
-
-    #[test]
-    fn test_is_domain_allowed_any_wildcard() {
-        let mut set = HashSet::new();
-        set.insert("*".to_string());
-        assert!(is_domain_allowed(&set, "anything.com"));
-        assert!(is_domain_allowed(&set, "sub.domain"));
-    }
-
 }
