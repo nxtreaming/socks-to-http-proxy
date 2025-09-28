@@ -5,6 +5,7 @@ mod connection;
 mod domain;
 mod session;
 mod socks;
+mod traffic;
 
 use crate::buffer_pool::{get_buffer, return_buffer};
 use crate::config::{Cli, ProxyConfig};
@@ -16,6 +17,11 @@ use crate::connection::{
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
+use crate::traffic::{get_counters_for_port, TrafficCounters};
+use std::path::PathBuf;
+use hyper::body::{Body, Frame, SizeHint};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use clap::Parser;
 use color_eyre::eyre::Result;
 
@@ -39,6 +45,49 @@ use hyper::{Method, Request, Response};
 
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+// Body wrapper that counts data bytes passing through
+#[derive(Debug, Clone, Copy)]
+enum CountDir { Rx, Tx }
+
+#[derive(Debug)]
+struct CountingBody<B> {
+    inner: B,
+    counters: Arc<TrafficCounters>,
+    dir: CountDir,
+}
+
+impl<B> Body for CountingBody<B>
+where
+    B: Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        // Safety: only projecting to inner field; we never move it after pin
+        let this = unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.inner) };
+        match this.poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // Count data bytes if present by transforming the data frame
+                let (counters, dir) = {
+                    let s = unsafe { self.get_unchecked_mut() };
+                    (Arc::clone(&s.counters), s.dir)
+                };
+                if let Some(data) = frame.data_ref() {
+                    match dir {
+                        CountDir::Rx => counters.add_rx(data.len() as u64),
+                        CountDir::Tx => counters.add_tx(data.len() as u64),
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool { self.inner.is_end_stream() }
+    fn size_hint(&self) -> SizeHint { self.inner.size_hint() }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,6 +113,36 @@ async fn main() -> Result<()> {
     // Precompute shared auth/domain configuration to avoid per-connection cloning
     let http_basic = Arc::new(config.http_basic_auth.clone());
     let allowed_domains = Arc::new(config.allowed_domains.clone());
+
+    // Traffic counters for this listening port
+    let listen_port = config.listen_addr.port();
+    let traffic_counters = get_counters_for_port(listen_port);
+    // Compute stats file path from config
+    let stats_path: PathBuf = match &config.stats_dir {
+        Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", listen_port)),
+        None => PathBuf::from(format!("traffic_stats_{}.txt", listen_port)),
+    };
+    // Load persisted traffic counters for this port (if any)
+    if let Err(e) = crate::traffic::load_from_file(&stats_path) {
+        warn!("Failed to load traffic stats from {:?}: {}", stats_path, e);
+    }
+
+    // Periodically log and persist traffic stats
+    {
+        let counters = Arc::clone(&traffic_counters);
+        let stats_path = stats_path.clone();
+        let interval = config.stats_interval.max(1);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                let (rx, tx) = counters.get();
+                info!("Traffic[port={}]: rx={}B, tx={}B", listen_port, rx, tx);
+                if let Err(e) = crate::traffic::save_port_to_file(listen_port, &stats_path) {
+                    warn!("Failed to save traffic stats: {}", e);
+                }
+            }
+        });
+    }
 
     // Create SOCKS5 connector
     let socks_connector = Arc::new(SocksConnector::new(
@@ -204,6 +283,7 @@ async fn main() -> Result<()> {
                     let http_basic = http_basic.clone();
                     let allowed_domains = allowed_domains.clone();
                     let config = Arc::clone(&config);
+                    let traffic_counters2 = Arc::clone(&traffic_counters);
                     let sessionid = if config.soax_settings.enabled {
                         Some(new_session_id())
                     } else {
@@ -212,6 +292,7 @@ async fn main() -> Result<()> {
                     tokio::task::spawn(async move {
                         let io = TokioIo::new(stream);
                         let sess = sessionid.clone();
+                        let counters = Arc::clone(&traffic_counters2);
                         let service = service_fn(move |req| {
                             proxy(
                                 req,
@@ -220,6 +301,7 @@ async fn main() -> Result<()> {
                                 allowed_domains.clone(),
                                 Arc::clone(&config),
                                 sess.clone(),
+                                Arc::clone(&counters),
                             )
                         });
 
@@ -269,6 +351,7 @@ async fn proxy(
     allowed_domains: Arc<Option<HashSet<String>>>,
     config: Arc<ProxyConfig>,
     sessionid: Option<String>,
+    traffic_counters: Arc<TrafficCounters>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Early return for disabled authentication
     if config.no_httpauth {
@@ -305,6 +388,31 @@ async fn proxy(
                 ));
             }
         }
+    }
+    // Management endpoints (require auth if enabled)
+    // Reset first
+    if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
+        let port = config.listen_addr.port();
+        crate::traffic::reset_port(port);
+        let stats_path: PathBuf = match &config.stats_dir {
+            Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", port)),
+            None => PathBuf::from(format!("traffic_stats_{}.txt", port)),
+        };
+        if let Err(e) = crate::traffic::save_port_to_file(port, &stats_path) {
+            warn!("Failed to persist stats after reset: {}", e);
+        }
+        let mut resp = Response::new(full("{\"ok\":true}"));
+        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return Ok(resp);
+    }
+    // Then GET stats
+    if req.method() == Method::GET && req.uri().path() == "/stats" {
+        let port = config.listen_addr.port();
+        let (rx, tx) = crate::traffic::snapshot(port).unwrap_or((0, 0));
+        let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
+        let mut resp = Response::new(full(body));
+        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return Ok(resp);
     }
 
     if let (Some(allowed_domains), Some(request_domain)) =
@@ -355,6 +463,7 @@ async fn proxy(
                             socks_connector,
                             idle_timeout,
                             sessionid.clone(),
+                            Arc::clone(&traffic_counters),
                         )
                         .await
                         {
@@ -417,6 +526,8 @@ async fn proxy(
                 info!("Moderate connection load: {}", current_connections);
             }
         }
+        // Count HTTP request body bytes (client -> proxy)
+        let req = req.map(|b| CountingBody { inner: b, counters: Arc::clone(&traffic_counters), dir: CountDir::Rx });
 
         let socks_stream = match socks_connector
             .connect(addr.as_str(), sessionid.as_deref())
@@ -508,8 +619,11 @@ async fn proxy(
         });
         // Intentionally do not abort conn_handle; it will finish when the connection shuts down.
 
+        // Count HTTP response body bytes (proxy -> client)
+        let resp = resp.map(|b| CountingBody { inner: b, counters: Arc::clone(&traffic_counters), dir: CountDir::Tx }.boxed());
+
         // Return the response body as-is; hyper will forward it to the client
-        Ok(resp.map(|b| b.boxed()))
+        Ok(resp)
     }
 }
 
@@ -545,6 +659,7 @@ async fn tunnel(
     socks_connector: Arc<SocksConnector>,
     idle_timeout: u64,
     sessionid: Option<String>,
+    traffic_counters: Arc<TrafficCounters>,
 ) -> Result<()> {
     // Check connection limits for stability
     if is_connection_limit_exceeded() {
@@ -641,6 +756,10 @@ async fn tunnel(
             }
         }
     }
+
+    // Accumulate per-port traffic counters for CONNECT tunnel path
+    traffic_counters.add_rx(from_client);
+    traffic_counters.add_tx(from_server);
 
     if let Err(e) = server.shutdown().await {
         // Only log unexpected shutdown errors

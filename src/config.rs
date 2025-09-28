@@ -16,7 +16,11 @@ pub struct Auths {
 
 /// Command line interface configuration
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author, version,
+    about = "Convert a SOCKS5 proxy into an HTTP proxy",
+    long_about = "sthp converts a SOCKS5 proxy into an HTTP proxy.\n\nKey features:\n- HTTP proxy over SOCKS5 (with optional HTTP Basic and SOCKS auth)\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints: GET /stats, POST /stats/reset (auth policy applies)\n"
+)]
 pub struct Cli {
     /// Port where HTTP proxy should listen
     #[arg(short, long, default_value_t = 8080)]
@@ -42,14 +46,20 @@ pub struct Cli {
     #[arg(long)]
     pub soax_package_id: Option<String>,
 
-    /// SOAX GEO parameters (optional)
-    #[arg(long)]
+    /// SOAX target country (ISO 3166-1 alpha-2 code or full name), e.g., "US" or "United States" (optional)
+    #[arg(long, value_name = "COUNTRY")]
     pub soax_country: Option<String>,
-    #[arg(long)]
+
+    /// SOAX target region/state/province within the country, e.g., "California" or "CA" (optional)
+    #[arg(long, value_name = "REGION")]
     pub soax_region: Option<String>,
-    #[arg(long)]
+
+    /// SOAX target city name, e.g., "Los Angeles" (optional)
+    #[arg(long, value_name = "CITY")]
     pub soax_city: Option<String>,
-    #[arg(long)]
+
+    /// SOAX target ISP/carrier name, e.g., "AT&T" (optional)
+    #[arg(long, value_name = "ISP")]
     pub soax_isp: Option<String>,
 
     /// SOAX session length in seconds (only used when sticky is enabled)
@@ -91,6 +101,14 @@ pub struct Cli {
     /// Force 'Connection: close' on forwarded HTTP requests
     #[arg(long, default_value_t = true)]
     pub force_close: bool,
+
+    /// Directory to persist traffic stats files (per-port). Default: current dir.
+    #[arg(long = "stats-dir")]
+    pub stats_dir: Option<String>,
+
+    /// Interval seconds to log and persist traffic stats
+    #[arg(long = "stats-interval", default_value_t = 60)]
+    pub stats_interval: u64,
 }
 
 /// SOAX proxy configuration settings
@@ -194,6 +212,8 @@ pub struct ProxyConfig {
     pub soax_settings: SoaxSettings,
     pub soax_password: Option<String>,
     pub socks_auth: Option<crate::auth::Auth>,
+    pub stats_dir: Option<String>,
+    pub stats_interval: u64,
 }
 
 impl ProxyConfig {
@@ -254,6 +274,8 @@ impl ProxyConfig {
             soax_settings,
             soax_password,
             socks_auth,
+            stats_dir: args.stats_dir.clone(),
+            stats_interval: args.stats_interval,
         })
     }
 }

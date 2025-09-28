@@ -82,22 +82,32 @@ There are a few options for using `sthp`.
 Usage: sthp [OPTIONS]
 
 Options:
-  -p, --port <PORT>                        port where Http proxy should listen [default: 8080]
+  -p, --port <PORT>                        Port where HTTP proxy should listen [default: 8080]
       --listen-ip <LISTEN_IP>              [default: 0.0.0.0]
   -u, --username <USERNAME>                Socks5 username
   -P, --password <PASSWORD>                Socks5 password
       --http-basic <USER:PASSWD>           HTTP Basic Auth
-      --no-httpauth <1/0>                  Ignore HTTP Basic Auth, [default: 1]
+      --no-httpauth <1/0>                  Ignore HTTP Basic Auth [default: 1]
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
       --allowed-domains <ALLOWED_DOMAINS>  Comma-separated list of allowed domains (supports exact, *.domain, .domain, or *)
       --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for tunnel connections [default: 540]
       --force-close <FORCE_CLOSE>          Force 'Connection: close' on forwarded HTTP requests [default: true]
                                            Set to false to allow HTTP/1.1 keep-alive for higher throughput
       --conn-per-ip <CONN_PER_IP>          Maximum connections per client IP [default: 500]
+      --stats-dir <STATS_DIR>              Directory to persist traffic stats files (per-port). Default: current dir
+      --stats-interval <SECONDS>           Interval seconds to log and persist traffic stats [default: 60]
 
   -h, --help                               Print help information
   -V, --version                            Print version information
 ```
+
+#### SOAX options (optional)
+
+- `--soax-country <COUNTRY>`: SOAX target country (ISO 3166-1 alpha-2 code or full name), e.g., "US" or "United States".
+- `--soax-region <REGION>`: SOAX target region/state/province within the country, e.g., "California" or "CA".
+- `--soax-city <CITY>`: SOAX target city name, e.g., "Los Angeles".
+- `--soax-isp <ISP>`: SOAX target ISP/carrier name, e.g., "AT&T".
+
 
 ## Performance & Stability Recommendations
 
@@ -174,6 +184,32 @@ Recommendations:
 - Keep `--force-close=true` in production unless you have measured benefits and sufficient headroom to allow keep-alive.
 - Tune `--idle-timeout` according to workload (shorter for highly ephemeral tunnels, longer for long-lived ones).
 - Adjust `--conn-per-ip` to reflect your multi-tenant policy and upstream capacity.
+
+
+## Traffic Statistics
+
+- Per-port cumulative byte counters (RX from client, TX to client)
+- Persistence: one file per listening port: `traffic_stats_{port}.txt` in `--stats-dir` (default: current directory)
+- Periodic logging and persistence every `--stats-interval` seconds (default: 60)
+- Management endpoints (apply the same HTTP auth policy as the proxy itself):
+  - `GET /stats` → `{"port":<u16>,"rx":<u64>,"tx":<u64>}`
+  - `POST /stats/reset` → `{"ok":true}` and immediately persists zeros
+
+Examples:
+```bash
+# If authentication is required (recommended), include Proxy-Authorization
+curl -s http://127.0.0.1:8080/stats \
+  -H "Proxy-Authorization: Basic $(printf 'user:pass' | base64)"
+
+# Reset counters and persist immediately
+curl -s -X POST http://127.0.0.1:8080/stats/reset \
+  -H "Proxy-Authorization: Basic $(printf 'user:pass' | base64)"
+
+# Start with custom stats directory and 30s interval
+sthp -p 8080 -s 127.0.0.1:1080 --stats-dir ./stats --stats-interval 30
+```
+
+
 
 ## Log Level Control
 
