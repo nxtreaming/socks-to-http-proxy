@@ -109,6 +109,41 @@ Options:
 - `--soax-isp <ISP>`: SOAX target ISP/carrier name, e.g., "AT&T".
 
 
+
+#### Connpnt vendor mode (optional)
+
+- `--connpnt-enable 1` to enable this vendor mode
+- `--connpnt-user <BASE_USER>`: base username provided by vendor (e.g., `ku2605kbkxid`)
+- `-P, --password <PASSWORD>`: vendor password (e.g., `kjjacvbu7huwd`)
+- `--connpnt-country <CC>`: country code (e.g., `US`, `BR`)
+- `--connpnt-keeptime <MINUTES>`: session keeptime in minutes (0 = unlimited)
+- `--connpnt-project <NAME>`: optional project name; ipstr becomes `NAME$<random>` to isolate per-project IP traversal
+- `--connpnt-entry-hosts <H1,H2,...>`: entry hosts list; default depends on country:
+  - `US` → `pv3.connpnt134.com,pv2.connpnt134.com`
+  - others → `pv5.connpnt134.com,pv4.connpnt134.com`
+- `--connpnt-socks-port <PORT>`: SOCKS port (default: 9135)
+
+Example:
+```bash
+# Start HTTP proxy that uses Connpnt SOCKS vendor under the hood
+sthp \
+  -p 8080 \
+  --connpnt-enable 1 \
+  --connpnt-user ku2605kbkxid \
+  --connpnt-country BR \
+  --connpnt-keeptime 0 \
+  -P kjjacvbu7huwd
+
+# Client traffic via local HTTP proxy on 8080
+curl -x http://127.0.0.1:8080 https://ipinfo.io
+```
+
+Notes:
+- Username is constructed per connection as `BASE-<ipstr>-<keeptime>-<country>-N`.
+  - `<ipstr>` is randomized each connection; if `--connpnt-project NAME` is set, it becomes `NAME$<random>` to isolate projects.
+  - When switching `country`, a new `<ipstr>` is generated automatically to ensure the change takes effect.
+- One of the configured entry hosts is pseudo-randomly selected per connection; each entry host maps to an independent IP pool.
+
 ## Performance & Stability Recommendations
 
 - Default for production: keep `--force-close=true` (historical default; now configurable). This forces `Connection: close` on forwarded HTTP requests and helps prevent lingering sockets/CLOSE_WAIT buildup. It slightly reduces throughput for large non-CONNECT HTTP transfers but yields more predictable resource usage.

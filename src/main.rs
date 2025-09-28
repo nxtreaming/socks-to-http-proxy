@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
         Arc::new(config.socks_auth.clone()),
         Arc::new(config.soax_password.clone()),
         Arc::new(config.soax_settings.clone()),
+        Arc::new(config.connpnt_settings.clone()),
     ));
 
     let listener = TcpListener::bind(config.listen_addr).await?;

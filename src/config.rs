@@ -78,6 +78,28 @@ pub struct Cli {
     #[arg(long = "soax-opt", value_delimiter = ',')]
     pub soax_opt: Option<Vec<String>>,
 
+    /// Connpnt vendor: enable mode (1/0)
+    #[arg(long = "connpnt-enable", value_parser = value_parser!(u8).range(0..=1), default_value_t = 0)]
+    pub connpnt_enable: u8,
+    /// Connpnt base username (e.g., "ku2605kbkxid")
+    #[arg(long = "connpnt-user")]
+    pub connpnt_user: Option<String>,
+    /// Connpnt target country (e.g., "US", "BR")
+    #[arg(long = "connpnt-country")]
+    pub connpnt_country: Option<String>,
+    /// Connpnt keeptime in minutes (0 means unlimited)
+    #[arg(long = "connpnt-keeptime")]
+    pub connpnt_keeptime: Option<u32>,
+    /// Connpnt project name to prefix ipstr (e.g., proj1, proj2)
+    #[arg(long = "connpnt-project")]
+    pub connpnt_project: Option<String>,
+    /// Connpnt entry hosts (comma-separated)
+    #[arg(long = "connpnt-entry-hosts", value_delimiter = ',')]
+    pub connpnt_entry_hosts: Option<Vec<String>>,
+    /// Connpnt SOCKS port (default 9135)
+    #[arg(long = "connpnt-socks-port")]
+    pub connpnt_socks_port: Option<u16>,
+
     /// Comma-separated list of allowed domains
     #[arg(long, value_delimiter = ',')]
     pub allowed_domains: Option<Vec<String>>,
@@ -102,6 +124,7 @@ pub struct Cli {
     #[arg(long, default_value_t = true)]
     pub force_close: bool,
 
+
     /// Directory to persist traffic stats files (per-port). Default: current dir.
     #[arg(long = "stats-dir")]
     pub stats_dir: Option<String>,
@@ -109,6 +132,70 @@ pub struct Cli {
     /// Interval seconds to log and persist traffic stats
     #[arg(long = "stats-interval", default_value_t = 60)]
     pub stats_interval: u64,
+}
+
+/// Connpnt-style vendor settings (dynamic username pattern)
+#[derive(Clone, Debug)]
+pub struct ConnpntSettings {
+    pub enabled: bool,
+    pub base_user: Option<String>,
+    pub country: Option<String>,
+    pub keeptime_minutes: u32,
+    pub project: Option<String>,
+    pub entry_hosts: Vec<String>,
+    pub socks_port: u16,
+}
+
+impl ConnpntSettings {
+    pub fn from_cli(args: &Cli) -> Self {
+        let enabled = args.connpnt_enable == 1;
+        let entry_hosts = if let Some(hs) = args.connpnt_entry_hosts.clone() {
+            hs
+        } else {
+            let is_us = args
+                .connpnt_country
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("US"))
+                .unwrap_or(false);
+            if is_us {
+                vec![
+                    "pv3.connpnt134.com".to_string(),
+                    "pv2.connpnt134.com".to_string(),
+                ]
+            } else {
+                vec![
+                    "pv5.connpnt134.com".to_string(),
+                    "pv4.connpnt134.com".to_string(),
+                ]
+            }
+        };
+        Self {
+            enabled,
+            base_user: args.connpnt_user.clone(),
+            country: args.connpnt_country.clone(),
+            keeptime_minutes: args.connpnt_keeptime.unwrap_or(0),
+            project: args.connpnt_project.clone(),
+            entry_hosts,
+            socks_port: args.connpnt_socks_port.unwrap_or(9135),
+        }
+    }
+
+    pub fn validate(&self, auth: &Option<crate::auth::Auth>) -> Result<(), String> {
+        if !self.enabled { return Ok(()); }
+        if self.base_user.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            return Err("Connpnt mode requires --connpnt-user".to_string());
+        }
+        if self.country.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            return Err("Connpnt mode requires --connpnt-country".to_string());
+        }
+        if auth.as_ref().map(|a| a.password.is_empty()).unwrap_or(true) {
+            return Err("Connpnt mode requires --password (-P) as vendor password".to_string());
+        }
+        if self.entry_hosts.is_empty() {
+            return Err("Connpnt mode requires at least one --connpnt-entry-hosts".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// SOAX proxy configuration settings
@@ -130,7 +217,7 @@ impl SoaxSettings {
     /// Build SOAX username string from configuration parameters
     pub fn build_username(&self, sessionid: Option<&str>) -> String {
         let mut parts: Vec<String> = Vec::with_capacity(16);
-        
+
         if let Some(pkg) = &self.package_id {
             parts.push(format!("package-{}", pkg));
         }
@@ -214,6 +301,7 @@ pub struct ProxyConfig {
     pub socks_auth: Option<crate::auth::Auth>,
     pub stats_dir: Option<String>,
     pub stats_interval: u64,
+    pub connpnt_settings: ConnpntSettings,
 }
 
 impl ProxyConfig {
@@ -223,7 +311,7 @@ impl ProxyConfig {
         use base64::Engine;
         use hyper::header::HeaderValue;
 
-        // Resolve SOCKS5 address
+        // Resolve default SOCKS5 address (used in Standard/SOAX modes)
         let socks_addr = match tokio::net::lookup_host(&args.socks_address).await {
             Ok(mut addrs) => match addrs.next() {
                 Some(addr) => addr,
@@ -255,11 +343,17 @@ impl ProxyConfig {
             .transpose()
             .map_err(|_| color_eyre::eyre::eyre!("Invalid HTTP Basic auth string"))?;
 
-        // Create SOAX settings
+        // Provider settings
         let soax_settings = SoaxSettings::from_cli(&args);
+        let connpnt_settings = ConnpntSettings::from_cli(&args);
 
-        // Validate SOAX configuration
+        // Validate provider configuration and mutual exclusivity
+        if soax_settings.enabled && connpnt_settings.enabled {
+            return Err(color_eyre::eyre::eyre!("SOAX and Connpnt modes cannot both be enabled"));
+        }
         soax_settings.validate(&soax_password)
+            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+        connpnt_settings.validate(&socks_auth)
             .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
         Ok(Self {
@@ -276,6 +370,7 @@ impl ProxyConfig {
             socks_auth,
             stats_dir: args.stats_dir.clone(),
             stats_interval: args.stats_interval,
+            connpnt_settings,
         })
     }
 }

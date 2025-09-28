@@ -1,5 +1,6 @@
 use crate::auth::Auth;
-use crate::config::SoaxSettings;
+use crate::config::{ConnpntSettings, SoaxSettings};
+use crate::session::new_session_id;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_socks::tcp::Socks5Stream;
@@ -9,10 +10,13 @@ use tokio_socks::tcp::Socks5Stream;
 pub enum SocksError {
     #[error("SOCKS5 connection failed: {0}")]
     ConnectionFailed(String),
-    
+
     #[error("SOAX configuration error: {0}")]
     SoaxConfigError(String),
-    
+
+    #[error("Vendor configuration error: {0}")]
+    VendorConfigError(String),
+
     #[error("Authentication failed: {0}")]
     #[allow(dead_code)]
     AuthenticationFailed(String),
@@ -28,6 +32,7 @@ pub struct SocksConnector {
     auth: Arc<Option<Auth>>,
     soax_password: Arc<Option<String>>,
     soax_settings: Arc<SoaxSettings>,
+    connpnt_settings: Arc<ConnpntSettings>,
 }
 
 impl SocksConnector {
@@ -37,12 +42,14 @@ impl SocksConnector {
         auth: Arc<Option<Auth>>,
         soax_password: Arc<Option<String>>,
         soax_settings: Arc<SoaxSettings>,
+        connpnt_settings: Arc<ConnpntSettings>,
     ) -> Self {
         Self {
             socks_addr,
             auth,
             soax_password,
             soax_settings,
+            connpnt_settings,
         }
     }
 
@@ -54,6 +61,8 @@ impl SocksConnector {
     ) -> SocksResult<Socks5Stream<tokio::net::TcpStream>> {
         if self.soax_settings.enabled {
             self.connect_soax(target_addr, sessionid).await
+        } else if self.connpnt_settings.enabled {
+            self.connect_connpnt(target_addr).await
         } else {
             self.connect_standard(target_addr).await
         }
@@ -136,6 +145,58 @@ impl SocksConnector {
         }
         Ok(())
     }
+    /// Connect using Connpnt vendor configuration
+    async fn connect_connpnt(
+        &self,
+        target_addr: &str,
+    ) -> SocksResult<Socks5Stream<tokio::net::TcpStream>> {
+        let settings = &*self.connpnt_settings;
+        if !settings.enabled {
+            return Err(SocksError::VendorConfigError("Connpnt mode not enabled".into()));
+        }
+        let base = settings
+            .base_user
+            .as_ref()
+            .ok_or_else(|| SocksError::VendorConfigError("Missing base_user".into()))?;
+        let country = settings
+            .country
+            .as_ref()
+            .ok_or_else(|| SocksError::VendorConfigError("Missing country".into()))?;
+        let password = self
+            .auth
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| SocksError::VendorConfigError("Missing vendor password (-P)".into()))?
+            .password
+            .clone();
+        // Build ipstr: project$<rand> or <rand>
+        let sid = new_session_id();
+        let rand8 = &sid[..8.min(sid.len())];
+        let ipstr = match &settings.project {
+            Some(p) if !p.is_empty() => format!("{}${}", p, rand8),
+            _ => rand8.to_string(),
+        };
+        let username = format!("{}-{}-{}-{}-N", base, ipstr, settings.keeptime_minutes, country);
+
+        // Pick a pseudo-random entry host per connection based on session id
+        let h = &sid[..8.min(sid.len())];
+        let seed = u64::from_str_radix(h, 16).unwrap_or(0);
+        let idx = (seed as usize) % settings.entry_hosts.len();
+        let host = &settings.entry_hosts[idx];
+        let socks_addr_str = format!("{}:{}", host, settings.socks_port);
+
+        // Resolve and connect
+        let mut resolved = tokio::net::lookup_host(&socks_addr_str)
+            .await
+            .map_err(|e| SocksError::ConnectionFailed(e.to_string()))?;
+        let addr = resolved
+            .next()
+            .ok_or_else(|| SocksError::ConnectionFailed("No addresses resolved for vendor host".into()))?;
+
+        Socks5Stream::connect_with_password(addr, target_addr, &username, &password)
+            .await
+            .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
+    }
 }
 
 /// Builder for creating SOCKS5 connectors
@@ -145,6 +206,7 @@ pub struct SocksConnectorBuilder {
     auth: Option<Auth>,
     soax_password: Option<String>,
     soax_settings: Option<SoaxSettings>,
+    connpnt_settings: Option<ConnpntSettings>,
 }
 
 #[allow(dead_code)]
@@ -156,6 +218,7 @@ impl SocksConnectorBuilder {
             auth: None,
             soax_password: None,
             soax_settings: None,
+            connpnt_settings: None,
         }
     }
 
@@ -183,6 +246,12 @@ impl SocksConnectorBuilder {
         self
     }
 
+    /// Set the Connpnt settings
+    pub fn connpnt_settings(mut self, settings: ConnpntSettings) -> Self {
+        self.connpnt_settings = Some(settings);
+        self
+    }
+
     /// Build the SOCKS5 connector
     pub fn build(self) -> SocksResult<SocksConnector> {
         let socks_addr = self.socks_addr
@@ -200,12 +269,22 @@ impl SocksConnectorBuilder {
             idlettl: None,
             opts: Vec::new(),
         });
+        let connpnt_settings = self.connpnt_settings.unwrap_or(ConnpntSettings {
+            enabled: false,
+            base_user: None,
+            country: None,
+            keeptime_minutes: 0,
+            project: None,
+            entry_hosts: Vec::new(),
+            socks_port: 9135,
+        });
 
         let connector = SocksConnector::new(
             socks_addr,
             Arc::new(self.auth),
             Arc::new(self.soax_password),
             Arc::new(soax_settings),
+            Arc::new(connpnt_settings),
         );
 
         // Validate the configuration
@@ -295,7 +374,7 @@ mod tests {
     fn test_socks_connector_builder() {
         let addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080);
         let auth = Auth::new("user".to_string(), "pass".to_string());
-        
+
         let connector = SocksConnectorBuilder::new()
             .socks_addr(addr)
             .auth(auth)
@@ -310,7 +389,7 @@ mod tests {
     fn test_socks_connector_builder_with_soax() {
         let addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080);
         let soax_settings = create_test_soax_settings();
-        
+
         let connector = SocksConnectorBuilder::new()
             .socks_addr(addr)
             .soax_password("test-password".to_string())
@@ -333,7 +412,7 @@ mod tests {
     fn test_socks_connector_validation_soax_missing_password() {
         let addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080);
         let soax_settings = create_test_soax_settings();
-        
+
         let result = SocksConnectorBuilder::new()
             .socks_addr(addr)
             .soax_settings(soax_settings)
@@ -346,20 +425,20 @@ mod tests {
     #[test]
     fn test_connection_stats() {
         let mut stats = ConnectionStats::default();
-        
+
         assert_eq!(stats.success_rate(), 0.0);
         assert_eq!(stats.failure_rate(), 0.0);
-        
+
         stats.record_success(true); // SOAX connection
         stats.record_success(false); // Standard connection
         stats.record_failure();
-        
+
         assert_eq!(stats.total_connections, 3);
         assert_eq!(stats.successful_connections, 2);
         assert_eq!(stats.failed_connections, 1);
         assert_eq!(stats.soax_connections, 1);
         assert_eq!(stats.standard_connections, 1);
-        
+
         assert!((stats.success_rate() - 66.67).abs() < 0.01);
         assert!((stats.failure_rate() - 33.33).abs() < 0.01);
     }
