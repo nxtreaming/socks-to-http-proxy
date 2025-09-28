@@ -9,7 +9,9 @@ pub struct Auths {
     #[arg(short = 'u', long)]
     pub username: Option<String>,
 
-    /// Socks5 password (SOAX package_key in --soax-sticky mode)
+    /// Socks5/vendor password (-P)
+    /// - SOAX mode: package_key
+    /// - Connpnt mode: vendor password
     #[arg(short = 'P', long)]
     pub password: Option<String>,
 }
@@ -180,7 +182,7 @@ impl ConnpntSettings {
         }
     }
 
-    pub fn validate(&self, auth: &Option<crate::auth::Auth>) -> Result<(), String> {
+    pub fn validate(&self, vendor_password: &Option<String>) -> Result<(), String> {
         if !self.enabled { return Ok(()); }
         if self.base_user.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
             return Err("Connpnt mode requires --connpnt-user".to_string());
@@ -188,8 +190,9 @@ impl ConnpntSettings {
         if self.country.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
             return Err("Connpnt mode requires --connpnt-country".to_string());
         }
-        if auth.as_ref().map(|a| a.password.is_empty()).unwrap_or(true) {
-            return Err("Connpnt mode requires --password (-P) as vendor password".to_string());
+        match vendor_password {
+            Some(p) if !p.is_empty() => {},
+            _ => return Err("Connpnt mode requires --password (-P) as vendor password".to_string()),
         }
         if self.entry_hosts.is_empty() {
             return Err("Connpnt mode requires at least one --connpnt-entry-hosts".to_string());
@@ -297,7 +300,7 @@ pub struct ProxyConfig {
     pub conn_per_ip: usize,
     pub force_close: bool,
     pub soax_settings: SoaxSettings,
-    pub soax_password: Option<String>,
+    pub vendor_password: Option<String>,
     pub socks_auth: Option<crate::auth::Auth>,
     pub stats_dir: Option<String>,
     pub stats_interval: u64,
@@ -326,8 +329,8 @@ impl ProxyConfig {
         // Convert allowed domains to HashSet
         let allowed_domains = args.allowed_domains.clone().map(|v| v.into_iter().collect());
 
-        // Extract SOAX password and SOCKS auth first
-        let soax_password = args.auth.as_ref().and_then(|a| a.password.clone());
+        // Extract vendor password (-P) and SOCKS auth separately
+        let vendor_password = args.auth.as_ref().and_then(|a| a.password.clone());
         let socks_auth = args.auth.as_ref()
             .and_then(|a| match (&a.username, &a.password) {
                 (Some(u), Some(p)) => Some(crate::auth::Auth::new(u.clone(), p.clone())),
@@ -351,9 +354,9 @@ impl ProxyConfig {
         if soax_settings.enabled && connpnt_settings.enabled {
             return Err(color_eyre::eyre::eyre!("SOAX and Connpnt modes cannot both be enabled"));
         }
-        soax_settings.validate(&soax_password)
+        soax_settings.validate(&vendor_password)
             .map_err(|e| color_eyre::eyre::eyre!(e))?;
-        connpnt_settings.validate(&socks_auth)
+        connpnt_settings.validate(&vendor_password)
             .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
         Ok(Self {
@@ -366,7 +369,7 @@ impl ProxyConfig {
             conn_per_ip: args.conn_per_ip,
             force_close: args.force_close,
             soax_settings,
-            soax_password,
+            vendor_password,
             socks_auth,
             stats_dir: args.stats_dir.clone(),
             stats_interval: args.stats_interval,

@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
     let socks_connector = Arc::new(SocksConnector::new(
         config.socks_addr,
         Arc::new(config.socks_auth.clone()),
-        Arc::new(config.soax_password.clone()),
+        Arc::new(config.vendor_password.clone()),
         Arc::new(config.soax_settings.clone()),
         Arc::new(config.connpnt_settings.clone()),
     ));

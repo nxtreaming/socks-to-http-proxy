@@ -30,7 +30,7 @@ pub type SocksResult<T> = Result<T, SocksError>;
 pub struct SocksConnector {
     socks_addr: SocketAddr,
     auth: Arc<Option<Auth>>,
-    soax_password: Arc<Option<String>>,
+    vendor_password: Arc<Option<String>>,
     soax_settings: Arc<SoaxSettings>,
     connpnt_settings: Arc<ConnpntSettings>,
 }
@@ -40,14 +40,14 @@ impl SocksConnector {
     pub fn new(
         socks_addr: SocketAddr,
         auth: Arc<Option<Auth>>,
-        soax_password: Arc<Option<String>>,
+        vendor_password: Arc<Option<String>>,
         soax_settings: Arc<SoaxSettings>,
         connpnt_settings: Arc<ConnpntSettings>,
     ) -> Self {
         Self {
             socks_addr,
             auth,
-            soax_password,
+            vendor_password,
             soax_settings,
             connpnt_settings,
         }
@@ -75,7 +75,7 @@ impl SocksConnector {
         sessionid: Option<&str>,
     ) -> SocksResult<Socks5Stream<tokio::net::TcpStream>> {
         let username = self.soax_settings.build_username(sessionid);
-        let password = self.soax_password
+        let password = self.vendor_password
             .as_ref()
             .as_ref()
             .ok_or_else(|| SocksError::SoaxConfigError(
@@ -140,7 +140,7 @@ impl SocksConnector {
     pub fn validate(&self) -> SocksResult<()> {
         if self.soax_settings.enabled {
             self.soax_settings
-                .validate(&self.soax_password.as_ref().clone())
+                .validate(&self.vendor_password.as_ref().clone())
                 .map_err(|e| SocksError::SoaxConfigError(e))?;
         }
         Ok(())
@@ -163,11 +163,10 @@ impl SocksConnector {
             .as_ref()
             .ok_or_else(|| SocksError::VendorConfigError("Missing country".into()))?;
         let password = self
-            .auth
+            .vendor_password
             .as_ref()
             .as_ref()
             .ok_or_else(|| SocksError::VendorConfigError("Missing vendor password (-P)".into()))?
-            .password
             .clone();
         // Build ipstr: project$<rand> or <rand>
         let sid = new_session_id();
@@ -204,7 +203,7 @@ impl SocksConnector {
 pub struct SocksConnectorBuilder {
     socks_addr: Option<SocketAddr>,
     auth: Option<Auth>,
-    soax_password: Option<String>,
+    vendor_password: Option<String>,
     soax_settings: Option<SoaxSettings>,
     connpnt_settings: Option<ConnpntSettings>,
 }
@@ -216,7 +215,7 @@ impl SocksConnectorBuilder {
         Self {
             socks_addr: None,
             auth: None,
-            soax_password: None,
+            vendor_password: None,
             soax_settings: None,
             connpnt_settings: None,
         }
@@ -234,9 +233,9 @@ impl SocksConnectorBuilder {
         self
     }
 
-    /// Set the SOAX password
-    pub fn soax_password(mut self, password: String) -> Self {
-        self.soax_password = Some(password);
+    /// Set the vendor password (-P). For SOAX this is the package_key.
+    pub fn vendor_password(mut self, password: String) -> Self {
+        self.vendor_password = Some(password);
         self
     }
 
@@ -282,7 +281,7 @@ impl SocksConnectorBuilder {
         let connector = SocksConnector::new(
             socks_addr,
             Arc::new(self.auth),
-            Arc::new(self.soax_password),
+            Arc::new(self.vendor_password),
             Arc::new(soax_settings),
             Arc::new(connpnt_settings),
         );
@@ -392,7 +391,7 @@ mod tests {
 
         let connector = SocksConnectorBuilder::new()
             .socks_addr(addr)
-            .soax_password("test-password".to_string())
+            .vendor_password("test-password".to_string())
             .soax_settings(soax_settings)
             .build()
             .expect("Should build successfully");
