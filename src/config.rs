@@ -83,21 +83,27 @@ pub struct Cli {
     /// Connpnt vendor: enable mode (1/0)
     #[arg(long = "connpnt-enable", value_parser = value_parser!(u8).range(0..=1), default_value_t = 0)]
     pub connpnt_enable: u8,
+
     /// Connpnt base username (e.g., "ku2605kbkxid")
     #[arg(long = "connpnt-user")]
     pub connpnt_user: Option<String>,
+
     /// Connpnt target country (e.g., "US", "BR")
     #[arg(long = "connpnt-country")]
     pub connpnt_country: Option<String>,
+
     /// Connpnt keeptime in minutes (0 means unlimited)
     #[arg(long = "connpnt-keeptime")]
     pub connpnt_keeptime: Option<u32>,
+
     /// Connpnt project name to prefix ipstr (e.g., proj1, proj2)
     #[arg(long = "connpnt-project")]
     pub connpnt_project: Option<String>,
+
     /// Connpnt entry hosts (comma-separated)
     #[arg(long = "connpnt-entry-hosts", value_delimiter = ',')]
     pub connpnt_entry_hosts: Option<Vec<String>>,
+
     /// Connpnt SOCKS port (default 9135)
     #[arg(long = "connpnt-socks-port")]
     pub connpnt_socks_port: Option<u16>,
@@ -125,7 +131,6 @@ pub struct Cli {
     /// Force 'Connection: close' on forwarded HTTP requests
     #[arg(long, default_value_t = true)]
     pub force_close: bool,
-
 
     /// Directory to persist traffic stats files (per-port). Default: current dir.
     #[arg(long = "stats-dir")]

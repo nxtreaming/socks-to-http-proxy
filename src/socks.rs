@@ -268,6 +268,7 @@ impl SocksConnectorBuilder {
             idlettl: None,
             opts: Vec::new(),
         });
+
         let connpnt_settings = self.connpnt_settings.unwrap_or(ConnpntSettings {
             enabled: false,
             base_user: None,

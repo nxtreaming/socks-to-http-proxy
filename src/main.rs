@@ -404,6 +404,7 @@ async fn proxy(
         }
         let mut resp = Response::new(full("{\"ok\":true}"));
         resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
         return Ok(resp);
     }
     // Then GET stats
@@ -413,6 +414,7 @@ async fn proxy(
         let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
         let mut resp = Response::new(full(body));
         resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
         return Ok(resp);
     }
 
@@ -428,6 +430,7 @@ async fn proxy(
                 "Access to this domain is not allowed through the proxy.",
             ));
             *resp.status_mut() = http::StatusCode::FORBIDDEN;
+
             return Ok(resp);
         }
     }
@@ -450,6 +453,7 @@ async fn proxy(
                         "Access to this domain is not allowed through the proxy.",
                     ));
                     *resp.status_mut() = http::StatusCode::FORBIDDEN;
+
                     return Ok(resp);
                 }
             }
@@ -490,6 +494,7 @@ async fn proxy(
                 warn!("HTTP request missing host: {:?}", req.uri());
                 let mut resp = Response::new(full("HTTP request missing host"));
                 *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+
                 return Ok(resp);
             }
         };
@@ -502,6 +507,7 @@ async fn proxy(
             warn!("Connection limit reached: {}", current_connections);
             let mut resp = Response::new(full("Server overloaded, please try again later"));
             *resp.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+
             return Ok(resp);
         }
 
@@ -539,6 +545,7 @@ async fn proxy(
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 let mut resp = Response::new(full("SOCKS5 connection failed"));
                 *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+
                 return Ok(resp);
             }
         };
@@ -602,6 +609,7 @@ async fn proxy(
                 );
                 let mut resp = Response::new(full("Request timeout"));
                 *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+
                 return Ok(resp);
             }
         };
