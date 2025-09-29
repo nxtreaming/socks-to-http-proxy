@@ -16,7 +16,7 @@ impl BufferPool {
     }
 
     /// Get a buffer from the pool or create a new one
-    /// 
+    ///
     /// # Arguments
     /// * `large` - If true, returns a 16KB buffer; otherwise returns an 8KB buffer
     pub fn get_buffer(&self, large: bool) -> Vec<u8> {
@@ -27,27 +27,36 @@ impl BufferPool {
             &self.small_buffers
         };
 
-        if let Ok(mut buffers) = pool.lock() {
-            if let Some(mut buffer) = buffers.pop() {
-                buffer.clear();
-                buffer.resize(size, 0);
-                return buffer;
+        // Handle mutex poisoning gracefully
+        match pool.lock() {
+            Ok(mut buffers) => {
+                if let Some(mut buffer) = buffers.pop() {
+                    buffer.clear();
+                    buffer.resize(size, 0);
+                    return buffer;
+                }
+            }
+            Err(poisoned) => {
+                // Recover from poisoned mutex by clearing the pool
+                let mut buffers = poisoned.into_inner();
+                buffers.clear();
+                // Continue to create new buffer
             }
         }
 
-        // Create new buffer if pool is empty
+        // Create new buffer if pool is empty or poisoned
         vec![0u8; size]
     }
 
     /// Return a buffer to the pool for reuse
-    /// 
+    ///
     /// # Arguments
     /// * `buffer` - The buffer to return to the pool
     /// * `large` - Whether this is a large buffer (16KB) or small buffer (8KB)
     pub fn return_buffer(&self, buffer: Vec<u8>, large: bool) {
-        // Only return buffers that are the expected size to avoid memory bloat
+        // Only return buffers that are the expected size and capacity to avoid memory bloat
         let expected_size = if large { 16384 } else { 8192 };
-        if buffer.len() != expected_size {
+        if buffer.len() != expected_size || buffer.capacity() > expected_size * 2 {
             return;
         }
 
@@ -56,11 +65,18 @@ impl BufferPool {
         } else {
             &self.small_buffers
         };
-        
-        if let Ok(mut buffers) = pool.lock() {
-            // Limit pool size to prevent excessive memory usage
-            if buffers.len() < 100 {
-                buffers.push(buffer);
+
+        // Handle mutex poisoning gracefully
+        match pool.lock() {
+            Ok(mut buffers) => {
+                // Limit pool size to prevent excessive memory usage
+                if buffers.len() < 100 {
+                    buffers.push(buffer);
+                }
+            }
+            Err(_) => {
+                // If mutex is poisoned, just drop the buffer
+                // The pool will be cleared on next get_buffer call
             }
         }
     }

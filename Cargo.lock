@@ -590,6 +590,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pin-project",
  "thiserror",
  "tokio",
  "tokio-socks",

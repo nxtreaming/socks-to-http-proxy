@@ -5,20 +5,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Generate a new unique session ID
-/// 
+///
 /// The session ID is composed of:
 /// - Current timestamp (lower 48 bits of nanoseconds since UNIX epoch)
 /// - Monotonic counter (lower 32 bits)
-/// 
+///
 /// This ensures uniqueness even with high concurrency and provides
 /// a compact, URL-safe lowercase hex representation.
+///
+/// Note: The counter will wrap around after 2^64 increments, but the timestamp
+/// component ensures uniqueness across time.
 pub fn new_session_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    
+
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    
+
+    // Check for counter overflow (very unlikely but possible)
+    if counter == u64::MAX {
+        // Log warning but continue - timestamp component provides uniqueness
+        eprintln!("Warning: Session counter overflow detected");
+    }
+
     // Use lower 48 bits of nanoseconds and lower 32 bits of counter
     // This provides good uniqueness while keeping the ID compact
     format!(

@@ -45,12 +45,42 @@ use hyper::{Method, Request, Response};
 
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use pin_project::pin_project;
+
+/// RAII guard for buffer management
+struct BufferGuard {
+    buffer: Option<Vec<u8>>,
+    large: bool,
+}
+
+impl BufferGuard {
+    fn new(buffer: Vec<u8>, large: bool) -> Self {
+        Self {
+            buffer: Some(buffer),
+            large,
+        }
+    }
+
+    fn take(&mut self) -> Option<Vec<u8>> {
+        self.buffer.take()
+    }
+}
+
+impl Drop for BufferGuard {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            return_buffer(buffer, self.large);
+        }
+    }
+}
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
 enum CountDir { Rx, Tx }
 
+#[pin_project]
 #[derive(Debug)]
 struct CountingBody<B> {
+    #[pin]
     inner: B,
     counters: Arc<TrafficCounters>,
     dir: CountDir,
@@ -63,20 +93,15 @@ where
     type Data = Bytes;
     type Error = B::Error;
 
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        // Safety: only projecting to inner field; we never move it after pin
-        let this = unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.inner) };
-        match this.poll_frame(cx) {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.project();
+        match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                // Count data bytes if present by transforming the data frame
-                let (counters, dir) = {
-                    let s = unsafe { self.get_unchecked_mut() };
-                    (Arc::clone(&s.counters), s.dir)
-                };
+                // Count data bytes if present
                 if let Some(data) = frame.data_ref() {
-                    match dir {
-                        CountDir::Rx => counters.add_rx(data.len() as u64),
-                        CountDir::Tx => counters.add_tx(data.len() as u64),
+                    match this.dir {
+                        CountDir::Rx => this.counters.add_rx(data.len() as u64),
+                        CountDir::Tx => this.counters.add_tx(data.len() as u64),
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -245,33 +270,25 @@ async fn main() -> Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
-                    // Check per-IP connection limits
+                    // Check per-IP connection limits atomically
                     let ip_tracker = get_ip_tracker();
                     let client_ip = peer_addr.ip();
                     let conn_limit = config.conn_per_ip;
-                    let current_ip_connections = ip_tracker.get_count(client_ip);
 
-                    if current_ip_connections >= conn_limit {
-                        warn!(
-                            "Connection limit exceeded for IP {}: {} connections",
-                            client_ip, current_ip_connections
-                        );
-                        // Close the connection immediately
-                        drop(stream);
-                        continue;
-                    }
-
-                    // Increment connection count for this IP
-                    let new_count = ip_tracker.increment(client_ip);
-                    if new_count > conn_limit {
-                        warn!(
-                            "Connection limit exceeded after increment for IP {}: {} connections",
-                            client_ip, new_count
-                        );
-                        ip_tracker.decrement(client_ip);
-                        drop(stream);
-                        continue;
-                    }
+                    // Atomically check and increment connection count
+                    let new_count = match ip_tracker.try_increment(client_ip, conn_limit) {
+                        Some(count) => count,
+                        None => {
+                            let current_count = ip_tracker.get_count(client_ip);
+                            warn!(
+                                "Connection limit exceeded for IP {}: {} connections (limit: {})",
+                                client_ip, current_count, conn_limit
+                            );
+                            // Close the connection immediately
+                            drop(stream);
+                            continue;
+                        }
+                    };
 
                     if new_count > 20 {
                         info!(
@@ -614,15 +631,15 @@ async fn proxy(
             }
         };
 
-        // We are done initiating the request. Keep driving the connection in background
-        // Note on `sender`: in hyper's (sender, conn) model, `conn` is the I/O driver
-        // that must keep running to stream the response body. Explicitly calling
-        // drop(sender) here is not required for a clean shutdown; dropping it only
-        // prevents issuing more requests and it will be dropped at scope end anyway.
-        // We keep the driver alive until EOF to avoid truncating large/slow responses.
+        // We are done initiating the request. Keep the connection driver running
+        // in the background until it finishes to ensure the response body is fully
+        // streamed and resources are cleaned up properly. In hyper's (sender, conn)
+        // model, `conn` is the I/O driver; keeping it alive is sufficient—no need
+        // to await sender.closed() here.
 
-        // and decrement the active counter only after the connection fully closes.
+        // Spawn a task to handle connection cleanup properly
         let _close_task = tokio::spawn(async move {
+            // Wait for connection driver to finish to ensure proper cleanup
             let _ = conn_handle.await; // wait for connection driver to finish
             drop(connection_guard); // RAII drop -> decrement
         });
@@ -681,7 +698,7 @@ async fn tunnel(
         .into());
     }
 
-    let mut connection_guard = ConnectionGuard::new();
+    let _connection_guard = ConnectionGuard::new();
     let conn_id = ConnectionGuard::active_count();
 
     let socks_stream = match socks_connector
@@ -705,10 +722,14 @@ async fn tunnel(
     let mut from_client = 0u64;
     let mut from_server = 0u64;
 
-    // Use buffer pool for memory optimization
+    // Use buffer pool for memory optimization with RAII guards
     let use_large_buffers = idle_timeout > 300;
-    let mut client_buf = get_buffer(use_large_buffers);
-    let mut server_buf = get_buffer(use_large_buffers);
+    let client_buf = get_buffer(use_large_buffers);
+    let server_buf = get_buffer(use_large_buffers);
+    let mut client_guard = BufferGuard::new(client_buf, use_large_buffers);
+    let mut server_guard = BufferGuard::new(server_buf, use_large_buffers);
+    let mut client_buf = client_guard.take().unwrap();
+    let mut server_buf = server_guard.take().unwrap();
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
     let mut error: Option<color_eyre::eyre::Error> = None;
@@ -786,11 +807,12 @@ async fn tunnel(
     drop(server);
     drop(client);
 
-    // Return buffers to pool for reuse
-    return_buffer(client_buf, use_large_buffers);
-    return_buffer(server_buf, use_large_buffers);
+    // Return buffers to pool for reuse via RAII guards
+    let _client_guard = BufferGuard::new(client_buf, use_large_buffers);
+    let _server_guard = BufferGuard::new(server_buf, use_large_buffers);
+    // Guards will automatically return buffers when dropped
 
-    connection_guard.decrement();
+    // connection_guard will be automatically decremented when dropped
     let remaining = ConnectionGuard::active_count();
 
     // Only log stats for very large transfers to reduce noise
