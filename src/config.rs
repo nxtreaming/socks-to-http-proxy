@@ -224,40 +224,52 @@ pub struct SoaxSettings {
 impl SoaxSettings {
     /// Build SOAX username string from configuration parameters
     pub fn build_username(&self, sessionid: Option<&str>) -> String {
-        let mut parts: Vec<String> = Vec::with_capacity(16);
+        fn append_key_value(username: &mut String, key: &str, value: impl std::fmt::Display) {
+            if !username.is_empty() {
+                username.push('-');
+            }
+            username.push_str(key);
+            username.push('-');
+            use std::fmt::Write as _;
+            let _ = write!(username, "{}", value);
+        }
+
+        let estimated_len = 32 + self.opts.iter().map(|opt| opt.len() + 5).sum::<usize>();
+        let mut username = String::with_capacity(estimated_len);
 
         if let Some(pkg) = &self.package_id {
-            parts.push(format!("package-{}", pkg));
+            append_key_value(&mut username, "package", pkg);
         }
-        if let Some(c) = &self.country {
-            parts.push(format!("country-{}", c));
+        if let Some(country) = &self.country {
+            append_key_value(&mut username, "country", country);
         }
-        if let Some(r) = &self.region {
-            parts.push(format!("region-{}", r));
+        if let Some(region) = &self.region {
+            append_key_value(&mut username, "region", region);
         }
-        if let Some(ci) = &self.city {
-            parts.push(format!("city-{}", ci));
+        if let Some(city) = &self.city {
+            append_key_value(&mut username, "city", city);
         }
-        if let Some(i) = &self.isp {
-            parts.push(format!("isp-{}", i));
+        if let Some(isp) = &self.isp {
+            append_key_value(&mut username, "isp", isp);
         }
 
         for opt in &self.opts {
-            parts.push(format!("opt-{}", opt));
+            append_key_value(&mut username, "opt", opt);
         }
 
         if let Some(sid) = sessionid {
-            parts.push(format!("sessionid-{}", sid));
+            append_key_value(&mut username, "sessionid", sid);
             // sessionlength only meaningful when sessionid is present
-            parts.push(format!("sessionlength-{}", self.sessionlength));
-            if let Some(b) = self.bindttl {
-                parts.push(format!("bindttl-{}", b));
+            append_key_value(&mut username, "sessionlength", self.sessionlength);
+            if let Some(bindttl) = self.bindttl {
+                append_key_value(&mut username, "bindttl", bindttl);
             }
-            if let Some(i) = self.idlettl {
-                parts.push(format!("idlettl-{}", i));
+            if let Some(idlettl) = self.idlettl {
+                append_key_value(&mut username, "idlettl", idlettl);
             }
         }
-        parts.join("-")
+
+        username
     }
 
     /// Create SoaxSettings from CLI arguments
@@ -380,5 +392,49 @@ impl ProxyConfig {
             stats_interval: args.stats_interval,
             connpnt_settings,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SoaxSettings;
+
+    fn base_settings() -> SoaxSettings {
+        SoaxSettings {
+            enabled: true,
+            package_id: Some("pkg123".to_string()),
+            country: Some("US".to_string()),
+            region: Some("CA".to_string()),
+            city: Some("LosAngeles".to_string()),
+            isp: Some("ATT".to_string()),
+            sessionlength: 300,
+            bindttl: Some(120),
+            idlettl: Some(60),
+            opts: vec!["uniqip".to_string(), "lookalike".to_string()],
+        }
+    }
+
+    #[test]
+    fn build_username_without_session() {
+        let mut settings = base_settings();
+        settings.bindttl = None;
+        settings.idlettl = None;
+
+        let username = settings.build_username(None);
+        assert_eq!(
+            username,
+            "package-pkg123-country-US-region-CA-city-LosAngeles-isp-ATT-opt-uniqip-opt-lookalike"
+        );
+    }
+
+    #[test]
+    fn build_username_with_session_and_ttls() {
+        let settings = base_settings();
+        let username = settings.build_username(Some("abcdef"));
+        assert_eq!(
+            username,
+            "package-pkg123-country-US-region-CA-city-LosAngeles-isp-ATT-opt-uniqip-opt-lookalike-\
+sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
+        );
     }
 }
