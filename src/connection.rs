@@ -57,6 +57,7 @@ impl IpConnectionTracker {
     }
 
     /// Increment connection count for an IP address
+    #[cfg(test)]
     pub fn increment(&self, ip: IpAddr) -> usize {
         match self.connections.lock() {
             Ok(mut connections) => {
