@@ -221,6 +221,12 @@ Recommendations:
 - Adjust `--conn-per-ip` to reflect your multi-tenant policy and upstream capacity.
 
 
+
+### Implementation notes (stability)
+
+- RAII buffer management: pooled buffers are automatically returned on scope exit, including error and early-return paths. This reduces memory churn and avoids leaks when many tunnels are opened/closed.
+- Per-IP connection limiting: enforcement uses an atomic check-and-increment under a single lock to prevent races that could temporarily exceed the configured cap.
+
 ## Traffic Statistics
 
 - Per-port cumulative byte counters (RX from client, TX to client)

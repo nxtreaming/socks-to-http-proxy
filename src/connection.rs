@@ -235,4 +235,24 @@ mod tests {
         assert_eq!(tracker.get_count(ip), 0);
     }
 
+    #[test]
+    fn test_try_increment_limit_behavior() {
+        let tracker = IpConnectionTracker::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let limit = 2;
+
+        // First two increments should succeed up to the limit
+        assert_eq!(tracker.try_increment(ip, limit), Some(1));
+        assert_eq!(tracker.try_increment(ip, limit), Some(2));
+
+        // Next increment should be rejected (would exceed limit)
+        assert_eq!(tracker.try_increment(ip, limit), None);
+        assert_eq!(tracker.get_count(ip), 2);
+
+        // After decrement, increment should succeed again
+        tracker.decrement(ip);
+        assert_eq!(tracker.try_increment(ip, limit), Some(2));
+    }
+
+
 }
