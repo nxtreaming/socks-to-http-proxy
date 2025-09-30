@@ -191,6 +191,13 @@ async fn main() -> Result<()> {
 
             let active = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
 
+            // Periodic cleanup of IP tracker to remove zero-count entries
+            let ip_tracker = get_ip_tracker();
+            let cleaned = ip_tracker.cleanup_zero_connections();
+            if cleaned > 0 {
+                info!("Cleaned up {} zero-connection IP entries", cleaned);
+            }
+
             // Only log when there are significant changes or high activity
             if active > 100 || (active > 0 && active != last_active_count) {
                 info!("SOCKS5 Status - Active connections: {}", active);
@@ -297,9 +304,10 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    let socks_connector = socks_connector.clone();
-                    let http_basic = http_basic.clone();
-                    let allowed_domains = allowed_domains.clone();
+                    // Clone Arc references for the spawned task
+                    let socks_connector = Arc::clone(&socks_connector);
+                    let http_basic = Arc::clone(&http_basic);
+                    let allowed_domains = Arc::clone(&allowed_domains);
                     let config = Arc::clone(&config);
                     let traffic_counters2 = Arc::clone(&traffic_counters);
                     let sessionid = if config.soax_settings.enabled {
@@ -314,9 +322,9 @@ async fn main() -> Result<()> {
                         let service = service_fn(move |req| {
                             proxy(
                                 req,
-                                socks_connector.clone(),
-                                http_basic.clone(),
-                                allowed_domains.clone(),
+                                Arc::clone(&socks_connector),
+                                Arc::clone(&http_basic),
+                                Arc::clone(&allowed_domains),
                                 Arc::clone(&config),
                                 sess.clone(),
                                 Arc::clone(&counters),
@@ -559,6 +567,8 @@ async fn proxy(
         {
             Ok(stream) => stream,
             Err(e) => {
+                // Ensure connection guard is properly decremented on error
+                connection_guard.decrement();
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 let mut resp = Response::new(full("SOCKS5 connection failed"));
                 *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
@@ -638,7 +648,8 @@ async fn proxy(
         // to await sender.closed() here.
 
         // Spawn a task to handle connection cleanup properly
-        let _close_task = tokio::spawn(async move {
+        // Important: We must not drop this task handle to ensure cleanup happens
+        tokio::spawn(async move {
             // Wait for connection driver to finish to ensure proper cleanup
             let _ = conn_handle.await; // wait for connection driver to finish
             drop(connection_guard); // RAII drop -> decrement
@@ -707,6 +718,7 @@ async fn tunnel(
     {
         Ok(stream) => stream,
         Err(e) => {
+            // Connection guard will be automatically dropped here, decrementing the counter
             return Err(color_eyre::eyre::eyre!(
                 "Upstream SOCKS5 connection failed: {}",
                 e

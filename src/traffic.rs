@@ -34,28 +34,49 @@ fn registry() -> &'static Mutex<HashMap<u16, Arc<TrafficCounters>>> {
 
 /// Get or create counters for a given listening port
 pub fn get_counters_for_port(port: u16) -> Arc<TrafficCounters> {
-    let mut map = registry().lock().unwrap();
-    map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default())).clone()
+    match registry().lock() {
+        Ok(mut map) => {
+            map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default())).clone()
+        }
+        Err(poisoned) => {
+            // Recover from poisoned mutex
+            let mut map = poisoned.into_inner();
+            map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default())).clone()
+        }
+    }
 }
 
 /// Reset counters for a given port
 pub fn reset_port(port: u16) {
-    let mut map = registry().lock().unwrap();
-    let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
-    entry.reset();
+    match registry().lock() {
+        Ok(mut map) => {
+            let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
+            entry.reset();
+        }
+        Err(poisoned) => {
+            // Recover from poisoned mutex
+            let mut map = poisoned.into_inner();
+            let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
+            entry.reset();
+        }
+    }
 }
 
 /// Snapshot of current counters for a port
 pub fn snapshot(port: u16) -> Option<(u64, u64)> {
-    let map = registry().lock().unwrap();
-    map.get(&port).map(|c| (c.rx(), c.tx()))
+    match registry().lock() {
+        Ok(map) => map.get(&port).map(|c| (c.rx(), c.tx())),
+        Err(_) => None, // Return None if mutex is poisoned
+    }
 }
 
 /// Snapshot of all counters (port, rx, tx)
 #[allow(dead_code)]
 pub fn all_snapshots() -> Vec<(u16, u64, u64)> {
-    let map = registry().lock().unwrap();
-    map.iter().map(|(p, c)| (*p, c.rx(), c.tx())).collect()
+    match registry().lock() {
+        Ok(map) => map.iter().map(|(p, c)| (*p, c.rx(), c.tx())).collect(),
+        Err(_) => Vec::new(), // Return empty vec if mutex is poisoned
+    }
 }
 
 /// Load counters from a simple text file: lines of "port\trx\ttx"
@@ -63,20 +84,28 @@ pub fn load_from_file(path: &Path) -> io::Result<()> {
     if !path.exists() { return Ok(()); }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut map = registry().lock().unwrap();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() { continue; }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
-        if let (Ok(port), Ok(rx), Ok(tx)) = (
-            parts[0].parse::<u16>(), parts[1].parse::<u64>(), parts[2].parse::<u64>()
-        ) {
-            let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
-            entry.set(rx, tx);
+
+    match registry().lock() {
+        Ok(mut map) => {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() { continue; }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 3 { continue; }
+                if let (Ok(port), Ok(rx), Ok(tx)) = (
+                    parts[0].parse::<u16>(), parts[1].parse::<u64>(), parts[2].parse::<u64>()
+                ) {
+                    let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
+                    entry.set(rx, tx);
+                }
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // If mutex is poisoned, return error
+            Err(io::Error::other("Registry mutex poisoned"))
         }
     }
-    Ok(())
 }
 
 /// Save a single port's counters to a file: one line "port\trx\ttx"

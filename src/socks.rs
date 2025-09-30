@@ -141,7 +141,7 @@ impl SocksConnector {
         if self.soax_settings.enabled {
             self.soax_settings
                 .validate(&self.vendor_password.as_ref().clone())
-                .map_err(|e| SocksError::SoaxConfigError(e))?;
+                .map_err(SocksError::SoaxConfigError)?;
         }
         Ok(())
     }

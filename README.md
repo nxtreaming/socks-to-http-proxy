@@ -6,7 +6,7 @@ An executable to convert SOCKS5 proxy into HTTP proxy
 
 `sthp` purpose is to create HTTP proxy on top of the Socks 5 Proxy
 
-## How it works
+## How it worksgit 
 
 It uses hyper library HTTP proxy [example](https://github.com/hyperium/hyper/blob/master/examples/http_proxy.rs) and adds functionality to connect via Socks5
 
