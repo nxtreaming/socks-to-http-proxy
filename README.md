@@ -90,7 +90,7 @@ Options:
       --no-httpauth <1/0>                  Ignore HTTP Basic Auth [default: 1]
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
       --allowed-domains <ALLOWED_DOMAINS>  Comma-separated list of allowed domains (supports exact, *.domain, .domain, or *)
-      --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for tunnel connections [default: 540]
+      --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for CONNECT tunnels and regular HTTP requests [default: 540]
       --force-close <FORCE_CLOSE>          Force 'Connection: close' on forwarded HTTP requests [default: true]
                                            Set to false to allow HTTP/1.1 keep-alive for higher throughput
       --conn-per-ip <CONN_PER_IP>          Maximum connections per client IP [default: 500]
@@ -151,7 +151,7 @@ Notes:
 - Pair with `--conn-per-ip` to bound per-client impact during spikes; start with 500 and tune based on upstream capacity and concurrency patterns.
 
 - CONNECT (HTTPS tunneling) is unaffected by `--force-close` and will remain stable with the existing idle timeout.
-- Keep the idle timeout (`--idle-timeout`, default 540s) aligned with your operational requirements. Lower it to reclaim idle tunnels more aggressively in resource-constrained environments.
+- Keep the idle timeout (`--idle-timeout`, default 540s) aligned with your operational requirements. For CONNECT tunnels it acts as an idle timer (resets on traffic; closes after a quiet window). For normal HTTP (non-CONNECT) requests it acts as a per-request timeout: exceeding it aborts the upstream connection and returns 504 Gateway Timeout. Lower the value to reclaim idle/stuck connections more aggressively in resource-constrained environments.
 
 ### Examples
 
@@ -212,7 +212,9 @@ sthp -p 8080 -s 127.0.0.1:1080 --allowed-domains "*"
 ## Connection Management
 
 - `--force-close` (default: true): Forces `Connection: close` on forwarded HTTP (non-CONNECT) requests. This has been the historical default; the flag simply makes it configurable. It favors stability and resource predictability over maximum throughput.
-- `--idle-timeout` (default: 540s): Applies to CONNECT tunnels. The idle timer resets on traffic; when no bytes flow in either direction for the timeout window, the tunnel is closed.
+- `--idle-timeout` (default: 540s): Applies to both CONNECT tunnels and normal HTTP requests.
+  - CONNECT: idle timer resets on traffic; when no bytes flow in either direction for the timeout window, the tunnel is closed.
+  - HTTP (non-CONNECT): acts as a per-request timeout; when exceeded, the upstream connection is aborted and a 504 Gateway Timeout is returned.
 - `--conn-per-ip` (default: 500): Enforces a per-client IP cap. New connections beyond the cap are immediately closed on accept.
 
 Recommendations:
@@ -337,7 +339,7 @@ RUST_LOG=sthp=info sthp -p 8080 -s 127.0.0.1:1080 > proxy.log 2>&1
 - Connection closes immediately on accept:
   - Per-IP limit reached. Increase `--conn-per-ip` or reduce client concurrency. See warn logs for IP counts.
 - Long-lived or stuck connections consuming resources:
-  - Prefer `--force-close=true` (default) for non-CONNECT requests. For CONNECT tunnels, tune `--idle-timeout`.
+  - Prefer `--force-close=true` (default) for non-CONNECT requests. Tune `--idle-timeout` (applies to both CONNECT tunnels and normal HTTP requests).
 - Bind error / port already in use:
   - Choose a different port with `-p <PORT>` or adjust `--listen-ip`.
 - Need more details to diagnose:
