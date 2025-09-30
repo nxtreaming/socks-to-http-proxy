@@ -139,6 +139,25 @@ impl IpConnectionTracker {
             Err(_) => 0,
         }
     }
+
+    /// Clean up IPs with zero connections (periodic maintenance)
+    #[allow(dead_code)]
+    pub fn cleanup_zero_connections(&self) -> usize {
+        match self.connections.lock() {
+            Ok(mut connections) => {
+                let before = connections.len();
+                connections.retain(|_, &mut count| count > 0);
+                before - connections.len()
+            }
+            Err(poisoned) => {
+                // Recover from poisoned mutex by clearing everything
+                let mut connections = poisoned.into_inner();
+                let count = connections.len();
+                connections.clear();
+                count
+            }
+        }
+    }
 }
 
 impl Default for IpConnectionTracker {

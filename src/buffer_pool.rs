@@ -53,12 +53,18 @@ impl BufferPool {
     /// # Arguments
     /// * `buffer` - The buffer to return to the pool
     /// * `large` - Whether this is a large buffer (16KB) or small buffer (8KB)
-    pub fn return_buffer(&self, buffer: Vec<u8>, large: bool) {
+    pub fn return_buffer(&self, mut buffer: Vec<u8>, large: bool) {
         // Only return buffers that are the expected size and capacity to avoid memory bloat
         let expected_size = if large { 16384 } else { 8192 };
+
+        // Reject buffers with wrong size or excessive capacity
         if buffer.len() != expected_size || buffer.capacity() > expected_size * 2 {
             return;
         }
+
+        // Clear the buffer to avoid leaking data between connections
+        buffer.clear();
+        buffer.resize(expected_size, 0);
 
         let pool = if large {
             &self.large_buffers
@@ -70,6 +76,7 @@ impl BufferPool {
         match pool.lock() {
             Ok(mut buffers) => {
                 // Limit pool size to prevent excessive memory usage
+                // Use a reasonable limit based on expected concurrency
                 if buffers.len() < 100 {
                     buffers.push(buffer);
                 }
