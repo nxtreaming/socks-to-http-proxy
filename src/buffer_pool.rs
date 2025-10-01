@@ -18,15 +18,12 @@ impl BufferPool {
     /// Helper to lock a buffer pool with poisoning recovery
     fn lock_pool(&self, large: bool) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
         let pool = if large { &self.large_buffers } else { &self.small_buffers };
-        match pool.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // Recover from poisoned mutex by clearing the pool
-                let mut guard = poisoned.into_inner();
-                guard.clear();
-                guard
-            }
-        }
+        pool.lock().unwrap_or_else(|poisoned| {
+            // Recover from poisoned mutex by clearing the pool
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            guard
+        })
     }
 
     /// Get a buffer from the pool or create a new one

@@ -76,15 +76,12 @@ impl IpConnectionTracker {
 
     /// Helper to lock the connections map with poisoning recovery
     fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
-        match self.connections.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // Recover from poisoned mutex by clearing potentially corrupted state
-                let mut guard = poisoned.into_inner();
-                guard.clear();
-                guard
-            }
-        }
+        self.connections.lock().unwrap_or_else(|poisoned| {
+            // Recover from poisoned mutex by clearing potentially corrupted state
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            guard
+        })
     }
 
     /// Increment connection count for an IP address
