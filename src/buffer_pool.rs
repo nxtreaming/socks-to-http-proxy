@@ -58,6 +58,7 @@ impl BufferPool {
         // Zero the buffer on return to avoid leaking data between connections
         buffer.clear();
         buffer.resize(expected_size, 0);
+        debug_assert_eq!(buffer.len(), expected_size);
 
         let mut pool = if large {
             self.large_buffers.lock().await
