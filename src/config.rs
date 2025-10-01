@@ -23,6 +23,7 @@ pub struct Auths {
     about = "Convert a SOCKS5 proxy into an HTTP proxy",
     long_about = "sthp converts a SOCKS5 proxy into an HTTP proxy.\n\nKey features:\n- HTTP proxy over SOCKS5 (with optional HTTP Basic and SOCKS auth)\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints: GET /stats, POST /stats/reset (auth policy applies)\n"
 )]
+
 pub struct Cli {
     /// Port where HTTP proxy should listen
     #[arg(short, long, default_value_t = 8080)]

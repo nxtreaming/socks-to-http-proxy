@@ -1,6 +1,6 @@
 [package]
 name = "sthp"
-version = "0.8.7"
+version = "0.8.8"
 license = "MIT"
 authors = ["Blackswan <nxtreaming@gmail.com>"]
 edition = "2021"

@@ -81,6 +81,7 @@ impl Drop for BufferGuard {
         }
     }
 }
+
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
 enum CountDir {

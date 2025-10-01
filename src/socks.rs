@@ -145,6 +145,7 @@ impl SocksConnector {
         }
         Ok(())
     }
+
     /// Connect using Connpnt vendor configuration
     async fn connect_connpnt(
         &self,
