@@ -158,12 +158,6 @@ pub fn get_ip_tracker() -> &'static IpConnectionTracker {
     IP_TRACKER.get_or_init(IpConnectionTracker::new)
 }
 
-/// Check if the current connection count exceeds the maximum limit
-#[allow(dead_code)]
-pub fn is_connection_limit_exceeded() -> bool {
-    ConnectionGuard::active_count() >= MAX_CONCURRENT_CONNECTIONS
-}
-
 /// Check if the current connection count exceeds the memory pressure threshold
 pub fn is_memory_pressure_high() -> bool {
     ConnectionGuard::active_count() > MEMORY_PRESSURE_THRESHOLD
