@@ -16,7 +16,7 @@ http = "1.1"
 hyper = { version = "1.5", features = ["client","server","http1"] }
 clap = { version = "4", features = ["derive"] }
 tokio-socks = "0.5"
-tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "net"] }
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "net", "sync"] }
 bytes = "1.8"
 http-body-util = "0.1"
 tracing = "0.1"
@@ -25,5 +25,3 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-au
 base64 = "0.22"
 thiserror = "1.0"
 pin-project = "1.1"
-dashmap = "6.1.0"
-crossbeam-utils = "0.8.21"

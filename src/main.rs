@@ -17,8 +17,9 @@ use crate::connection::{
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
-use crate::traffic::{get_counters_for_port, load_from_file, reset_port,
-                     save_port_to_file, snapshot, TrafficCounters};
+use crate::traffic::{
+    get_counters_for_port, load_from_file, reset_port, save_port_to_file, snapshot, TrafficCounters,
+};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use hyper::body::{Body, Frame, SizeHint};
@@ -70,7 +71,12 @@ impl BufferGuard {
 impl Drop for BufferGuard {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            return_buffer(buffer, self.large);
+            let large = self.large;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    return_buffer(buffer, large).await;
+                });
+            }
         }
     }
 }
@@ -213,11 +219,11 @@ async fn main() -> Result<()> {
 
     // Traffic counters for this listening port
     let listen_port = config.listen_addr.port();
-    let traffic_counters = get_counters_for_port(listen_port);
+    let traffic_counters = get_counters_for_port(listen_port).await;
     // Compute stats file path from config
     let stats_path = get_stats_path(&config);
     // Load persisted traffic counters for this port (if any)
-    if let Err(e) = load_from_file(&stats_path) {
+    if let Err(e) = load_from_file(&stats_path).await {
         warn!("Failed to load traffic stats from {:?}: {}", stats_path, e);
     }
 
@@ -231,7 +237,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                 let (rx, tx) = counters.get();
                 info!("Traffic[port={}]: rx={}B, tx={}B", listen_port, rx, tx);
-                if let Err(e) = save_port_to_file(listen_port, &stats_path) {
+                if let Err(e) = save_port_to_file(listen_port, &stats_path).await {
                     warn!("Failed to save traffic stats: {}", e);
                 }
             }
@@ -262,7 +268,7 @@ async fn main() -> Result<()> {
 
             // Periodic cleanup of IP tracker to remove zero-count entries
             let ip_tracker = get_ip_tracker();
-            let cleaned = ip_tracker.cleanup_zero_connections();
+            let cleaned = ip_tracker.cleanup_zero_connections().await;
             if cleaned > 0 {
                 info!("Cleaned up {} zero-connection IP entries", cleaned);
             }
@@ -352,10 +358,10 @@ async fn main() -> Result<()> {
                     let conn_limit = config.conn_per_ip;
 
                     // Atomically check and increment connection count
-                    let new_count = match ip_tracker.try_increment(client_ip, conn_limit) {
+                    let new_count = match ip_tracker.try_increment(client_ip, conn_limit).await {
                         Some(count) => count,
                         None => {
-                            let current_count = ip_tracker.get_count(client_ip);
+                            let current_count = ip_tracker.get_count(client_ip).await;
                             warn!(
                                 "Connection limit exceeded for IP {}: {} connections (limit: {})",
                                 client_ip, current_count, conn_limit
@@ -414,7 +420,7 @@ async fn main() -> Result<()> {
                         }
 
                         // Decrement IP connection count when connection ends
-                        ip_tracker.decrement(client_ip);
+                        ip_tracker.decrement(client_ip).await;
                     });
                 }
                 Err(e) => {
@@ -488,9 +494,9 @@ async fn proxy(
     // Reset first
     if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
         let port = config.listen_addr.port();
-        reset_port(port);
+        reset_port(port).await;
         let stats_path = get_stats_path(&config);
-        if let Err(e) = save_port_to_file(port, &stats_path) {
+        if let Err(e) = save_port_to_file(port, &stats_path).await {
             warn!("Failed to persist stats after reset: {}", e);
         }
         return Ok(json_response("{\"ok\":true}".to_string()));
@@ -498,7 +504,7 @@ async fn proxy(
     // Then GET stats
     if req.method() == Method::GET && req.uri().path() == "/stats" {
         let port = config.listen_addr.port();
-        let (rx, tx) = snapshot(port).unwrap_or((0, 0));
+        let (rx, tx) = snapshot(port).await.unwrap_or((0, 0));
         let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
         return Ok(json_response(body));
     }
@@ -833,8 +839,8 @@ async fn tunnel(
 
     // Use buffer pool for memory optimization with RAII guards
     let use_large_buffers = idle_timeout > 300;
-    let client_buf = get_buffer(use_large_buffers);
-    let server_buf = get_buffer(use_large_buffers);
+    let client_buf = get_buffer(use_large_buffers).await;
+    let server_buf = get_buffer(use_large_buffers).await;
     let mut client_guard = BufferGuard::new(client_buf, use_large_buffers);
     let mut server_guard = BufferGuard::new(server_buf, use_large_buffers);
     let mut client_buf = client_guard.take().unwrap();
