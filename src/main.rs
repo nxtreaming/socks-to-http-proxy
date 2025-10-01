@@ -46,8 +46,9 @@ use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 
 use hyper_util::rt::TokioIo;
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 /// RAII guard for buffer management
 struct BufferGuard {
@@ -131,40 +132,22 @@ where
     }
 }
 
-// RAII wrapper for connection cleanup that owns both guard and handle
-struct ConnectionCleanup {
-    _connection_guard: ConnectionGuard,
-    _conn_handle: tokio::task::JoinHandle<()>,
-}
-
-impl ConnectionCleanup {
-    fn new(guard: ConnectionGuard, handle: tokio::task::JoinHandle<()>) -> Self {
-        Self {
-            _connection_guard: guard,
-            _conn_handle: handle,
-        }
-    }
-}
-
-// Note: We don't implement Drop because we want the conn_handle to complete naturally.
-// The JoinHandle will be dropped when ConnectionCleanup is dropped, which detaches
-// the task and allows it to continue running in the background until completion.
-// The ConnectionGuard will be automatically dropped, decrementing the counter.
-
-// Body wrapper that owns ConnectionCleanup for proper cleanup
-// This eliminates the need for a separate spawned task to wait for cleanup
-#[pin_project]
+// Body wrapper that owns both the connection guard and the driver handle
+// ensuring the handle is completed or aborted before the guard is released.
+#[pin_project(PinnedDrop)]
 struct GuardedBody<B> {
     #[pin]
     inner: B,
-    _cleanup: ConnectionCleanup,
+    connection_guard: Option<ConnectionGuard>,
+    driver_handle: Option<JoinHandle<()>>,
 }
 
 impl<B> GuardedBody<B> {
-    fn new(inner: B, guard: ConnectionGuard, handle: tokio::task::JoinHandle<()>) -> Self {
+    fn new(inner: B, guard: ConnectionGuard, handle: JoinHandle<()>) -> Self {
         Self {
             inner,
-            _cleanup: ConnectionCleanup::new(guard, handle),
+            connection_guard: Some(guard),
+            driver_handle: Some(handle),
         }
     }
 }
@@ -189,6 +172,20 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[pinned_drop]
+impl<B> PinnedDrop for GuardedBody<B> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if let Some(handle) = this.driver_handle.take() {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+
+        drop(this.connection_guard.take());
     }
 }
 
@@ -572,7 +569,7 @@ async fn proxy(
         let addr = format!("{}:{}", host, port);
 
         let mut connection_guard = match ConnectionGuard::try_new() {
-            Some(guard) => guard,
+            Some(guard) => Some(guard),
             None => {
                 let current_connections = ConnectionGuard::active_count();
                 warn!(
@@ -619,8 +616,9 @@ async fn proxy(
         {
             Ok(stream) => stream,
             Err(e) => {
-                // Ensure connection guard is properly decremented on error
-                connection_guard.decrement();
+                if let Some(mut guard) = connection_guard.take() {
+                    guard.decrement();
+                }
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 return Ok(error_response(
                     http::StatusCode::BAD_GATEWAY,
@@ -670,7 +668,9 @@ async fn proxy(
                     },
                     Err(e) => {
                         conn_handle.abort();
-                        connection_guard.decrement();
+                        if let Some(mut guard) = connection_guard.take() {
+                            guard.decrement();
+                        }
                         let remaining = ConnectionGuard::active_count();
                         warn!("HTTP #{} connection error, {} active", conn_id, remaining);
                         return Err(e);
@@ -680,7 +680,9 @@ async fn proxy(
             _ = &mut idle_timer => {
                 // Timeout reached - abort the connection
                 conn_handle.abort();
-                connection_guard.decrement();
+                if let Some(mut guard) = connection_guard.take() {
+                    guard.decrement();
+                }
                 let remaining = ConnectionGuard::active_count();
                 warn!(
                     "HTTP #{} timeout after {:?}, {} active",
@@ -697,13 +699,17 @@ async fn proxy(
         // The GuardedBody will own the ConnectionGuard and conn_handle,
         // ensuring proper cleanup when the body is dropped without needing
         // a separate spawned task. This reduces scheduler overhead.
-        let resp = resp.map(|b| {
+        let guard = connection_guard
+            .take()
+            .expect("connection_guard should exist when mapping response body");
+        let counters = Arc::clone(&traffic_counters);
+        let resp = resp.map(move |b| {
             let counting_body = CountingBody {
                 inner: b,
-                counters: Arc::clone(&traffic_counters),
+                counters: Arc::clone(&counters),
                 dir: CountDir::Tx,
             };
-            GuardedBody::new(counting_body, connection_guard, conn_handle).boxed()
+            GuardedBody::new(counting_body, guard, conn_handle).boxed()
         });
 
         // Return the response body as-is; hyper will forward it to the client
@@ -949,7 +955,10 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose;
     use base64::Engine;
+    use bytes::Bytes;
+    use http_body_util::Empty;
     use hyper::header::HeaderValue;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_http_basic_auth_header_creation() {
@@ -1021,5 +1030,24 @@ mod tests {
 
         // HashSet should be significantly faster for large datasets
         assert!(hashset_duration < vec_duration);
+    }
+
+    #[tokio::test]
+    async fn guarded_body_releases_connection_guard() {
+        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+
+        let guard = ConnectionGuard::try_new().expect("expected guard to be acquired");
+        assert_eq!(ConnectionGuard::active_count(), 1);
+
+        let handle = tokio::spawn(async {});
+
+        {
+            let body = GuardedBody::new(Empty::<Bytes>::new(), guard, handle);
+            drop(body);
+        }
+
+        tokio::task::yield_now().await;
+
+        assert_eq!(ConnectionGuard::active_count(), 0);
     }
 }
