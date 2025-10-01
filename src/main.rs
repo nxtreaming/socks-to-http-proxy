@@ -10,20 +10,20 @@ mod traffic;
 use crate::buffer_pool::{get_buffer, return_buffer};
 use crate::config::{Cli, ProxyConfig};
 use crate::connection::{
-    get_ip_tracker, is_backlog_threshold_exceeded, is_connection_limit_exceeded,
-    is_memory_pressure_high, ConnectionGuard, ACTIVE_SOCKS5_CONNECTIONS,
-    CONNECTION_BACKLOG_THRESHOLD, MEMORY_PRESSURE_THRESHOLD,
+    get_ip_tracker, is_backlog_threshold_exceeded, is_memory_pressure_high, ConnectionGuard,
+    ACTIVE_SOCKS5_CONNECTIONS, CONNECTION_BACKLOG_THRESHOLD, MAX_CONCURRENT_CONNECTIONS,
+    MEMORY_PRESSURE_THRESHOLD,
 };
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
 use crate::traffic::{get_counters_for_port, TrafficCounters};
-use std::path::PathBuf;
-use hyper::body::{Body, Frame, SizeHint};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use clap::Parser;
 use color_eyre::eyre::Result;
+use hyper::body::{Body, Frame, SizeHint};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -44,8 +44,8 @@ use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
 use pin_project::pin_project;
+use tokio::net::TcpListener;
 
 /// RAII guard for buffer management
 struct BufferGuard {
@@ -75,7 +75,10 @@ impl Drop for BufferGuard {
 }
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
-enum CountDir { Rx, Tx }
+enum CountDir {
+    Rx,
+    Tx,
+}
 
 #[pin_project]
 #[derive(Debug)]
@@ -93,7 +96,10 @@ where
     type Data = Bytes;
     type Error = B::Error;
 
-    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = self.project();
         match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -110,8 +116,12 @@ where
         }
     }
 
-    fn is_end_stream(&self) -> bool { self.inner.is_end_stream() }
-    fn size_hint(&self) -> SizeHint { self.inner.size_hint() }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[tokio::main]
@@ -476,7 +486,7 @@ async fn proxy(
             warn!("CONNECT host is not socket addr: {:?}", req.uri());
             Ok(error_response(
                 http::StatusCode::BAD_REQUEST,
-                "CONNECT must be to a socket address"
+                "CONNECT must be to a socket address",
             ))
         }
     } else {
@@ -486,24 +496,27 @@ async fn proxy(
                 warn!("HTTP request missing host: {:?}", req.uri());
                 return Ok(error_response(
                     http::StatusCode::BAD_REQUEST,
-                    "HTTP request missing host"
+                    "HTTP request missing host",
                 ));
             }
         };
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
-        // Check connection limits for stability
-        if is_connection_limit_exceeded() {
-            let current_connections = ConnectionGuard::active_count();
-            warn!("Connection limit reached: {}", current_connections);
-            return Ok(error_response(
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                "Server overloaded, please try again later"
-            ));
-        }
-
-        let mut connection_guard = ConnectionGuard::new();
+        let mut connection_guard = match ConnectionGuard::try_new() {
+            Some(guard) => guard,
+            None => {
+                let current_connections = ConnectionGuard::active_count();
+                warn!(
+                    "Connection limit reached: {} (max: {})",
+                    current_connections, MAX_CONCURRENT_CONNECTIONS
+                );
+                return Ok(error_response(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Server overloaded, please try again later",
+                ));
+            }
+        };
         let conn_id = ConnectionGuard::active_count();
 
         // Multi-level warning system for high-capacity server
@@ -526,7 +539,11 @@ async fn proxy(
             }
         }
         // Count HTTP request body bytes (client -> proxy)
-        let req = req.map(|b| CountingBody { inner: b, counters: Arc::clone(&traffic_counters), dir: CountDir::Rx });
+        let req = req.map(|b| CountingBody {
+            inner: b,
+            counters: Arc::clone(&traffic_counters),
+            dir: CountDir::Rx,
+        });
 
         let socks_stream = match socks_connector
             .connect(addr.as_str(), sessionid.as_deref())
@@ -539,7 +556,7 @@ async fn proxy(
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 return Ok(error_response(
                     http::StatusCode::BAD_GATEWAY,
-                    "SOCKS5 connection failed"
+                    "SOCKS5 connection failed",
                 ));
             }
         };
@@ -624,7 +641,14 @@ async fn proxy(
         // Intentionally do not abort conn_handle; it will finish when the connection shuts down.
 
         // Count HTTP response body bytes (proxy -> client)
-        let resp = resp.map(|b| CountingBody { inner: b, counters: Arc::clone(&traffic_counters), dir: CountDir::Tx }.boxed());
+        let resp = resp.map(|b| {
+            CountingBody {
+                inner: b,
+                counters: Arc::clone(&traffic_counters),
+                dir: CountDir::Tx,
+            }
+            .boxed()
+        });
 
         // Return the response body as-is; hyper will forward it to the client
         Ok(resp)
@@ -650,7 +674,10 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 /// Helper function to create an error response with status code
-fn error_response(status: http::StatusCode, message: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
+fn error_response(
+    status: http::StatusCode,
+    message: &'static str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut resp = Response::new(full(message));
     *resp.status_mut() = status;
     resp
@@ -661,7 +688,7 @@ fn json_response(body: String) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut resp = Response::new(full(body));
     resp.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json")
+        HeaderValue::from_static("application/json"),
     );
     resp
 }
@@ -693,7 +720,10 @@ fn check_domain_access(
 ) -> Result<(), Box<Response<BoxBody<Bytes, hyper::Error>>>> {
     if let Some(allowed) = allowed_domains {
         if !is_domain_allowed(allowed, domain) {
-            warn!("Access to domain {} is not allowed through the proxy.", domain);
+            warn!(
+                "Access to domain {} is not allowed through the proxy.",
+                domain
+            );
             return Err(Box::new(error_response(
                 http::StatusCode::FORBIDDEN,
                 "Access to this domain is not allowed through the proxy.",
@@ -711,18 +741,21 @@ async fn tunnel(
     sessionid: Option<String>,
     traffic_counters: Arc<TrafficCounters>,
 ) -> Result<()> {
-    // Check connection limits for stability
-    if is_connection_limit_exceeded() {
-        let current_connections = ConnectionGuard::active_count();
-        warn!("Tunnel connection limit reached: {}", current_connections);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "Server overloaded",
-        )
-        .into());
-    }
-
-    let _connection_guard = ConnectionGuard::new();
+    let _connection_guard = match ConnectionGuard::try_new() {
+        Some(guard) => guard,
+        None => {
+            let current_connections = ConnectionGuard::active_count();
+            warn!(
+                "Tunnel connection limit reached: {} (max: {})",
+                current_connections, MAX_CONCURRENT_CONNECTIONS
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Server overloaded",
+            )
+            .into());
+        }
+    };
     let conn_id = ConnectionGuard::active_count();
 
     let socks_stream = match socks_connector
