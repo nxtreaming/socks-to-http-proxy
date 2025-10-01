@@ -17,7 +17,8 @@ use crate::connection::{
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
-use crate::traffic::{get_counters_for_port, TrafficCounters};
+use crate::traffic::{get_counters_for_port, load_from_file, reset_port,save_port_to_file,
+                     snapshot, TrafficCounters};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use hyper::body::{Body, Frame, SizeHint};
@@ -155,7 +156,7 @@ async fn main() -> Result<()> {
     // Compute stats file path from config
     let stats_path = get_stats_path(&config);
     // Load persisted traffic counters for this port (if any)
-    if let Err(e) = crate::traffic::load_from_file(&stats_path) {
+    if let Err(e) = load_from_file(&stats_path) {
         warn!("Failed to load traffic stats from {:?}: {}", stats_path, e);
     }
 
@@ -169,7 +170,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                 let (rx, tx) = counters.get();
                 info!("Traffic[port={}]: rx={}B, tx={}B", listen_port, rx, tx);
-                if let Err(e) = crate::traffic::save_port_to_file(listen_port, &stats_path) {
+                if let Err(e) = save_port_to_file(listen_port, &stats_path) {
                     warn!("Failed to save traffic stats: {}", e);
                 }
             }
@@ -426,9 +427,9 @@ async fn proxy(
     // Reset first
     if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
         let port = config.listen_addr.port();
-        crate::traffic::reset_port(port);
+        reset_port(port);
         let stats_path = get_stats_path(&config);
-        if let Err(e) = crate::traffic::save_port_to_file(port, &stats_path) {
+        if let Err(e) = save_port_to_file(port, &stats_path) {
             warn!("Failed to persist stats after reset: {}", e);
         }
         return Ok(json_response("{\"ok\":true}".to_string()));
@@ -436,7 +437,7 @@ async fn proxy(
     // Then GET stats
     if req.method() == Method::GET && req.uri().path() == "/stats" {
         let port = config.listen_addr.port();
-        let (rx, tx) = crate::traffic::snapshot(port).unwrap_or((0, 0));
+        let (rx, tx) = snapshot(port).unwrap_or((0, 0));
         let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
         return Ok(json_response(body));
     }
