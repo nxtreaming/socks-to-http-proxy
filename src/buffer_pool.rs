@@ -36,10 +36,25 @@ impl BufferPool {
         };
 
         if let Some(mut buffer) = pool.pop() {
-            // Restore length without zeroing again; buffer was zeroed on return
-            unsafe {
-                buffer.set_len(size);
+            let capacity = buffer.capacity();
+
+            // Returned buffers should already be sized appropriately, but double-check in debug
+            debug_assert!(capacity >= size);
+            debug_assert!(capacity <= size * 2);
+
+            if capacity < size {
+                // Capacity mismatch - fall back to allocating a fresh buffer.
+                return vec![0u8; size];
             }
+
+            if buffer.len() > size {
+                buffer.truncate(size);
+            } else if buffer.len() < size {
+                unsafe {
+                    buffer.set_len(size);
+                }
+            }
+
             buffer
         } else {
             vec![0u8; size]
@@ -253,5 +268,42 @@ mod tests {
 
         let stats = get_pool_stats().await;
         assert!(stats.small_buffers_available > 0 || stats.large_buffers_available > 0);
+    }
+
+    #[tokio::test]
+    async fn test_reused_small_buffer_length_and_zeroing() {
+        let pool = BufferPool::new();
+
+        let mut buf = pool.get_buffer(false).await;
+        let capacity = buf.capacity();
+
+        // Modify contents and shrink length to simulate consumer behavior
+        buf.fill(0xAA);
+        buf.truncate(128);
+
+        pool.return_buffer(buf, false).await;
+
+        let reused = pool.get_buffer(false).await;
+        assert_eq!(reused.len(), 8_192);
+        assert_eq!(reused.capacity(), capacity);
+        assert!(reused.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn test_reused_large_buffer_length_and_zeroing() {
+        let pool = BufferPool::new();
+
+        let mut buf = pool.get_buffer(true).await;
+        let capacity = buf.capacity();
+
+        buf.fill(0x55);
+        buf.truncate(256);
+
+        pool.return_buffer(buf, true).await;
+
+        let reused = pool.get_buffer(true).await;
+        assert_eq!(reused.len(), 16_384);
+        assert_eq!(reused.capacity(), capacity);
+        assert!(reused.iter().all(|&b| b == 0));
     }
 }
