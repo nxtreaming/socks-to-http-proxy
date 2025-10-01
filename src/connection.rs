@@ -3,6 +3,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
+#[cfg(test)]
+use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
+
 /// Global counter for tracking active SOCKS5 connections
 pub static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -72,6 +75,19 @@ impl IpConnectionTracker {
         Self {
             connections: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Acquire a read lock for inspecting the connections map in tests.
+    #[cfg(test)]
+    pub async fn lock_connections(&self) -> RwLockReadGuard<'_, HashMap<IpAddr, usize>> {
+        self.connections.read().await
+    }
+
+    /// Acquire a write lock for mutating the connections map in tests.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn lock_connections_mut(&self) -> RwLockWriteGuard<'_, HashMap<IpAddr, usize>> {
+        self.connections.write().await
     }
 
     /// Increment connection count for an IP address
@@ -204,21 +220,41 @@ mod tests {
         let count1 = tracker.increment(ip).await;
         assert_eq!(count1, 1);
         assert_eq!(tracker.get_count(ip).await, 1);
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&1));
+        }
 
         let count2 = tracker.increment(ip).await;
         assert_eq!(count2, 2);
         assert_eq!(tracker.get_count(ip).await, 2);
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&2));
+        }
 
         // Test decrement
         tracker.decrement(ip).await;
         assert_eq!(tracker.get_count(ip).await, 1);
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&1));
+        }
 
         tracker.decrement(ip).await;
         assert_eq!(tracker.get_count(ip).await, 0);
+        {
+            let connections = tracker.lock_connections().await;
+            assert!(!connections.contains_key(&ip));
+        }
 
         // IP should be removed when count reaches 0
         tracker.decrement(ip).await; // Should not panic
         assert_eq!(tracker.get_count(ip).await, 0);
+        {
+            let connections = tracker.lock_connections().await;
+            assert!(!connections.contains_key(&ip));
+        }
     }
 
     #[tokio::test]
@@ -230,14 +266,26 @@ mod tests {
         // First two increments should succeed up to the limit
         assert_eq!(tracker.try_increment(ip, limit).await, Some(1));
         assert_eq!(tracker.try_increment(ip, limit).await, Some(2));
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&2));
+        }
 
         // Next increment should be rejected (would exceed limit)
         assert_eq!(tracker.try_increment(ip, limit).await, None);
         assert_eq!(tracker.get_count(ip).await, 2);
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&2));
+        }
 
         // After decrement, increment should succeed again
         tracker.decrement(ip).await;
         assert_eq!(tracker.try_increment(ip, limit).await, Some(2));
+        {
+            let connections = tracker.lock_connections().await;
+            assert_eq!(connections.get(&ip), Some(&2));
+        }
     }
 
     #[test]
