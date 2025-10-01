@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Global counter for tracking active SOCKS5 connections
 pub static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -17,10 +17,28 @@ pub struct ConnectionGuard {
 }
 
 impl ConnectionGuard {
-    /// Create a new connection guard and increment the global counter
-    pub fn new() -> Self {
-        ACTIVE_SOCKS5_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-        Self { decremented: false }
+    /// Attempt to create a new connection guard and increment the global counter.
+    ///
+    /// Returns `None` if acquiring a new slot would exceed the
+    /// [`MAX_CONCURRENT_CONNECTIONS`] limit.
+    pub fn try_new() -> Option<Self> {
+        let mut current = ACTIVE_SOCKS5_CONNECTIONS.load(Ordering::Relaxed);
+
+        loop {
+            if current >= MAX_CONCURRENT_CONNECTIONS {
+                return None;
+            }
+
+            match ACTIVE_SOCKS5_CONNECTIONS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { decremented: false }),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Manually decrement the connection counter
@@ -141,6 +159,7 @@ pub fn get_ip_tracker() -> &'static IpConnectionTracker {
 }
 
 /// Check if the current connection count exceeds the maximum limit
+#[allow(dead_code)]
 pub fn is_connection_limit_exceeded() -> bool {
     ConnectionGuard::active_count() >= MAX_CONCURRENT_CONNECTIONS
 }
@@ -166,7 +185,7 @@ mod tests {
         ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
 
         {
-            let _guard = ConnectionGuard::new();
+            let _guard = ConnectionGuard::try_new().expect("guard should be acquired");
             assert_eq!(ConnectionGuard::active_count(), 1);
         }
 
@@ -180,7 +199,7 @@ mod tests {
         ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
 
         {
-            let mut guard = ConnectionGuard::new();
+            let mut guard = ConnectionGuard::try_new().expect("guard should be acquired");
             assert_eq!(ConnectionGuard::active_count(), 1);
 
             guard.decrement();
@@ -240,5 +259,13 @@ mod tests {
         assert_eq!(tracker.try_increment(ip, limit), Some(2));
     }
 
+    #[test]
+    fn test_connection_guard_respects_limit() {
+        ACTIVE_SOCKS5_CONNECTIONS.store(MAX_CONCURRENT_CONNECTIONS, Ordering::Relaxed);
 
+        assert!(ConnectionGuard::try_new().is_none());
+
+        // Reset counter so subsequent tests are unaffected
+        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+    }
 }
