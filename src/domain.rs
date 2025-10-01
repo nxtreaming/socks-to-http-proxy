@@ -35,26 +35,27 @@ pub fn is_domain_allowed(allowed: &HashSet<String>, host: &str) -> bool {
     false
 }
 
+/// Check if a host matches a suffix with proper dot boundary
+fn matches_suffix_with_boundary(host: &str, suffix: &str) -> bool {
+    if host.ends_with(suffix) && host.len() > suffix.len() {
+        let boundary_pos = host.len() - suffix.len() - 1;
+        return host.as_bytes().get(boundary_pos) == Some(&b'.');
+    }
+    false
+}
+
 /// Check if a host matches a specific pattern
 fn is_pattern_match(pattern: &str, host: &str) -> bool {
+    // Leading dot pattern: .example.com
+    // Matches apex domain or any subdomain of suffix
+    if let Some(suffix) = pattern.strip_prefix('.') {
+        return host == suffix || matches_suffix_with_boundary(host, suffix);
+    }
+
+    // Wildcard subdomain pattern: *.example.com
+    // Matches any subdomain of suffix (but not the apex domain)
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        // Wildcard subdomain pattern: *.example.com
-        // Matches any subdomain of suffix (but not the apex domain)
-        if host.ends_with(suffix) && host.len() > suffix.len() {
-            // Ensure there is a dot boundary before suffix
-            let boundary_pos = host.len() - suffix.len() - 1;
-            return host.as_bytes().get(boundary_pos) == Some(&b'.');
-        }
-    } else if let Some(suffix) = pattern.strip_prefix('.') {
-        // Leading dot pattern: .example.com
-        // Matches apex domain or any subdomain of suffix
-        if host == suffix {
-            return true;
-        }
-        if host.ends_with(suffix) && host.len() > suffix.len() {
-            let boundary_pos = host.len() - suffix.len() - 1;
-            return host.as_bytes().get(boundary_pos) == Some(&b'.');
-        }
+        return matches_suffix_with_boundary(host, suffix);
     }
 
     false
