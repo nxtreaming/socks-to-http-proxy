@@ -15,36 +15,35 @@ impl BufferPool {
         }
     }
 
+    /// Helper to lock a buffer pool with poisoning recovery
+    fn lock_pool(&self, large: bool) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
+        let pool = if large { &self.large_buffers } else { &self.small_buffers };
+        match pool.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Recover from poisoned mutex by clearing the pool
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                guard
+            }
+        }
+    }
+
     /// Get a buffer from the pool or create a new one
     ///
     /// # Arguments
     /// * `large` - If true, returns a 16KB buffer; otherwise returns an 8KB buffer
     pub fn get_buffer(&self, large: bool) -> Vec<u8> {
         let size = if large { 16384 } else { 8192 };
-        let pool = if large {
-            &self.large_buffers
-        } else {
-            &self.small_buffers
-        };
+        let mut buffers = self.lock_pool(large);
 
-        // Handle mutex poisoning gracefully
-        match pool.lock() {
-            Ok(mut buffers) => {
-                if let Some(mut buffer) = buffers.pop() {
-                    buffer.clear();
-                    buffer.resize(size, 0);
-                    return buffer;
-                }
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex by clearing the pool
-                let mut buffers = poisoned.into_inner();
-                buffers.clear();
-                // Continue to create new buffer
-            }
+        if let Some(mut buffer) = buffers.pop() {
+            buffer.clear();
+            buffer.resize(size, 0);
+            return buffer;
         }
 
-        // Create new buffer if pool is empty or poisoned
+        // Create new buffer if pool is empty
         vec![0u8; size]
     }
 
@@ -66,38 +65,19 @@ impl BufferPool {
         buffer.clear();
         buffer.resize(expected_size, 0);
 
-        let pool = if large {
-            &self.large_buffers
-        } else {
-            &self.small_buffers
-        };
-
-        // Handle mutex poisoning gracefully
-        match pool.lock() {
-            Ok(mut buffers) => {
-                // Limit pool size to prevent excessive memory usage
-                // Use a reasonable limit based on expected concurrency
-                if buffers.len() < 100 {
-                    buffers.push(buffer);
-                }
-            }
-            Err(_) => {
-                // If mutex is poisoned, just drop the buffer
-                // The pool will be cleared on next get_buffer call
-            }
+        let mut buffers = self.lock_pool(large);
+        // Limit pool size to prevent excessive memory usage
+        // Use a reasonable limit based on expected concurrency
+        if buffers.len() < 100 {
+            buffers.push(buffer);
         }
     }
 
     /// Get statistics about the buffer pool
     #[allow(dead_code)]
     pub fn stats(&self) -> BufferPoolStats {
-        let small_count = self.small_buffers.lock()
-            .map(|buffers| buffers.len())
-            .unwrap_or(0);
-        
-        let large_count = self.large_buffers.lock()
-            .map(|buffers| buffers.len())
-            .unwrap_or(0);
+        let small_count = self.lock_pool(false).len();
+        let large_count = self.lock_pool(true).len();
 
         BufferPoolStats {
             small_buffers_available: small_count,
@@ -109,12 +89,8 @@ impl BufferPool {
     /// Clear all buffers from the pool (useful for testing or memory cleanup)
     #[allow(dead_code)]
     pub fn clear(&self) {
-        if let Ok(mut small_buffers) = self.small_buffers.lock() {
-            small_buffers.clear();
-        }
-        if let Ok(mut large_buffers) = self.large_buffers.lock() {
-            large_buffers.clear();
-        }
+        self.lock_pool(false).clear();
+        self.lock_pool(true).clear();
     }
 }
 

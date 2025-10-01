@@ -56,107 +56,73 @@ impl IpConnectionTracker {
         }
     }
 
+    /// Helper to lock the connections map with poisoning recovery
+    fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+        match self.connections.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Recover from poisoned mutex by clearing potentially corrupted state
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                guard
+            }
+        }
+    }
+
     /// Increment connection count for an IP address
     #[cfg(test)]
     pub fn increment(&self, ip: IpAddr) -> usize {
-        match self.connections.lock() {
-            Ok(mut connections) => {
-                let count = connections.entry(ip).or_insert(0);
-                *count += 1;
-                *count
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex
-                let mut connections = poisoned.into_inner();
-                connections.clear(); // Clear potentially corrupted state
-                let count = connections.entry(ip).or_insert(0);
-                *count += 1;
-                *count
-            }
-        }
+        let mut connections = self.lock_connections();
+        let count = connections.entry(ip).or_insert(0);
+        *count += 1;
+        *count
     }
 
     /// Try to increment connection count if it doesn't exceed the limit
     /// Returns Some(new_count) if successful, None if limit would be exceeded
     pub fn try_increment(&self, ip: IpAddr, limit: usize) -> Option<usize> {
-        match self.connections.lock() {
-            Ok(mut connections) => {
-                let count = connections.entry(ip).or_insert(0);
-                if *count >= limit {
-                    return None;
-                }
-                *count += 1;
-                Some(*count)
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex - be conservative and reject
-                let mut connections = poisoned.into_inner();
-                connections.clear(); // Clear potentially corrupted state
-                let count = connections.entry(ip).or_insert(0);
-                if *count >= limit {
-                    return None;
-                }
-                *count += 1;
-                Some(*count)
-            }
+        let mut connections = self.lock_connections();
+        let count = connections.entry(ip).or_insert(0);
+        if *count >= limit {
+            return None;
         }
+        *count += 1;
+        Some(*count)
     }
 
     /// Decrement connection count for an IP address
     pub fn decrement(&self, ip: IpAddr) {
-        match self.connections.lock() {
-            Ok(mut connections) => {
-                if let Some(count) = connections.get_mut(&ip) {
-                    if *count > 0 {
-                        *count -= 1;
-                    }
-                    if *count == 0 {
-                        connections.remove(&ip);
-                    }
-                }
+        let mut connections = self.lock_connections();
+        if let Some(count) = connections.get_mut(&ip) {
+            if *count > 0 {
+                *count -= 1;
             }
-            Err(poisoned) => {
-                // Recover from poisoned mutex
-                let mut connections = poisoned.into_inner();
-                connections.clear(); // Clear potentially corrupted state
+            if *count == 0 {
+                connections.remove(&ip);
             }
         }
     }
 
     /// Get current connection count for an IP address
     pub fn get_count(&self, ip: IpAddr) -> usize {
-        match self.connections.lock() {
-            Ok(connections) => connections.get(&ip).copied().unwrap_or(0),
-            Err(_) => 0, // Return 0 if mutex is poisoned
-        }
+        let connections = self.lock_connections();
+        connections.get(&ip).copied().unwrap_or(0)
     }
 
     /// Get total number of tracked IPs
     #[allow(dead_code)]
     pub fn tracked_ips_count(&self) -> usize {
-        match self.connections.lock() {
-            Ok(connections) => connections.len(),
-            Err(_) => 0,
-        }
+        let connections = self.lock_connections();
+        connections.len()
     }
 
     /// Clean up IPs with zero connections (periodic maintenance)
     #[allow(dead_code)]
     pub fn cleanup_zero_connections(&self) -> usize {
-        match self.connections.lock() {
-            Ok(mut connections) => {
-                let before = connections.len();
-                connections.retain(|_, &mut count| count > 0);
-                before - connections.len()
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex by clearing everything
-                let mut connections = poisoned.into_inner();
-                let count = connections.len();
-                connections.clear();
-                count
-            }
-        }
+        let mut connections = self.lock_connections();
+        let before = connections.len();
+        connections.retain(|_, &mut count| count > 0);
+        before - connections.len()
     }
 }
 

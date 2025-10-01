@@ -143,10 +143,7 @@ async fn main() -> Result<()> {
     let listen_port = config.listen_addr.port();
     let traffic_counters = get_counters_for_port(listen_port);
     // Compute stats file path from config
-    let stats_path: PathBuf = match &config.stats_dir {
-        Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", listen_port)),
-        None => PathBuf::from(format!("traffic_stats_{}.txt", listen_port)),
-    };
+    let stats_path = get_stats_path(&config);
     // Load persisted traffic counters for this port (if any)
     if let Err(e) = crate::traffic::load_from_file(&stats_path) {
         warn!("Failed to load traffic stats from {:?}: {}", stats_path, e);
@@ -420,43 +417,24 @@ async fn proxy(
     if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
         let port = config.listen_addr.port();
         crate::traffic::reset_port(port);
-        let stats_path: PathBuf = match &config.stats_dir {
-            Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", port)),
-            None => PathBuf::from(format!("traffic_stats_{}.txt", port)),
-        };
+        let stats_path = get_stats_path(&config);
         if let Err(e) = crate::traffic::save_port_to_file(port, &stats_path) {
             warn!("Failed to persist stats after reset: {}", e);
         }
-        let mut resp = Response::new(full("{\"ok\":true}"));
-        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        return Ok(resp);
+        return Ok(json_response("{\"ok\":true}".to_string()));
     }
     // Then GET stats
     if req.method() == Method::GET && req.uri().path() == "/stats" {
         let port = config.listen_addr.port();
         let (rx, tx) = crate::traffic::snapshot(port).unwrap_or((0, 0));
         let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
-        let mut resp = Response::new(full(body));
-        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        return Ok(resp);
+        return Ok(json_response(body));
     }
 
-    if let (Some(allowed_domains), Some(request_domain)) =
-        (allowed_domains.as_ref(), req.uri().host())
-    {
-        if !is_domain_allowed(allowed_domains, request_domain) {
-            warn!(
-                "Access to domain {} is not allowed through the proxy.",
-                request_domain
-            );
-            let mut resp = Response::new(full(
-                "Access to this domain is not allowed through the proxy.",
-            ));
-            *resp.status_mut() = http::StatusCode::FORBIDDEN;
-
-            return Ok(resp);
+    // Check domain access for non-CONNECT requests
+    if let Some(request_domain) = req.uri().host() {
+        if let Err(resp) = check_domain_access(allowed_domains.as_ref(), request_domain) {
+            return Ok(*resp);
         }
     }
 
@@ -465,21 +443,10 @@ async fn proxy(
             let socks_connector = socks_connector.clone();
             // HTTPS (CONNECT) domain filtering based on allowed_domains
             // For CONNECT, the request URI is authority-form (host:port). Use authority().host().
-            if let (Some(allowed), Some(authority)) =
-                (allowed_domains.as_ref().as_ref(), req.uri().authority())
-            {
+            if let Some(authority) = req.uri().authority() {
                 let host = authority.host();
-                if !is_domain_allowed(allowed, host) {
-                    warn!(
-                        "Access to domain {} is not allowed through the proxy (CONNECT).",
-                        host
-                    );
-                    let mut resp = Response::new(full(
-                        "Access to this domain is not allowed through the proxy.",
-                    ));
-                    *resp.status_mut() = http::StatusCode::FORBIDDEN;
-
-                    return Ok(resp);
+                if let Err(resp) = check_domain_access(allowed_domains.as_ref(), host) {
+                    return Ok(*resp);
                 }
             }
 
@@ -507,20 +474,20 @@ async fn proxy(
             Ok(Response::new(empty()))
         } else {
             warn!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(full("CONNECT must be to a socket address"));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-
-            Ok(resp)
+            Ok(error_response(
+                http::StatusCode::BAD_REQUEST,
+                "CONNECT must be to a socket address"
+            ))
         }
     } else {
         let host = match req.uri().host() {
             Some(h) => h,
             None => {
                 warn!("HTTP request missing host: {:?}", req.uri());
-                let mut resp = Response::new(full("HTTP request missing host"));
-                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-
-                return Ok(resp);
+                return Ok(error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "HTTP request missing host"
+                ));
             }
         };
         let port = req.uri().port_u16().unwrap_or(80);
@@ -530,10 +497,10 @@ async fn proxy(
         if is_connection_limit_exceeded() {
             let current_connections = ConnectionGuard::active_count();
             warn!("Connection limit reached: {}", current_connections);
-            let mut resp = Response::new(full("Server overloaded, please try again later"));
-            *resp.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
-
-            return Ok(resp);
+            return Ok(error_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "Server overloaded, please try again later"
+            ));
         }
 
         let mut connection_guard = ConnectionGuard::new();
@@ -570,10 +537,10 @@ async fn proxy(
                 // Ensure connection guard is properly decremented on error
                 connection_guard.decrement();
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
-                let mut resp = Response::new(full("SOCKS5 connection failed"));
-                *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
-
-                return Ok(resp);
+                return Ok(error_response(
+                    http::StatusCode::BAD_GATEWAY,
+                    "SOCKS5 connection failed"
+                ));
             }
         };
 
@@ -634,10 +601,10 @@ async fn proxy(
                     "HTTP #{} timeout after {:?}, {} active",
                     conn_id, timeout_duration, remaining
                 );
-                let mut resp = Response::new(full("Request timeout"));
-                *resp.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
-
-                return Ok(resp);
+                return Ok(error_response(
+                    http::StatusCode::GATEWAY_TIMEOUT,
+                    "Request timeout"
+                ));
             }
         };
 
@@ -668,12 +635,38 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().map(|auth| auth.to_string())
 }
 
+/// Helper function to create an empty response body
 fn empty() -> BoxBody<Bytes, hyper::Error> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
 }
 
+/// Helper function to create a full response body
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// Helper function to create an error response with status code
+fn error_response(status: http::StatusCode, message: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full(message));
+    *resp.status_mut() = status;
+    resp
+}
+
+/// Helper function to create a JSON response
+fn json_response(body: String) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full(body));
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json")
+    );
+    resp
+}
+
+/// Helper function to create a 407 Proxy Authentication Required response
 fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut response = Response::new(full(msg));
     *response.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
@@ -684,10 +677,30 @@ fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hy
     response
 }
 
-fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
-    Full::new(chunk.into())
-        .map_err(|never| match never {})
-        .boxed()
+/// Helper function to compute stats file path
+fn get_stats_path(config: &ProxyConfig) -> PathBuf {
+    let port = config.listen_addr.port();
+    match &config.stats_dir {
+        Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", port)),
+        None => PathBuf::from(format!("traffic_stats_{}.txt", port)),
+    }
+}
+
+/// Helper function to check domain access
+fn check_domain_access(
+    allowed_domains: &Option<HashSet<String>>,
+    domain: &str,
+) -> Result<(), Box<Response<BoxBody<Bytes, hyper::Error>>>> {
+    if let Some(allowed) = allowed_domains {
+        if !is_domain_allowed(allowed, domain) {
+            warn!("Access to domain {} is not allowed through the proxy.", domain);
+            return Err(Box::new(error_response(
+                http::StatusCode::FORBIDDEN,
+                "Access to this domain is not allowed through the proxy.",
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn tunnel(
