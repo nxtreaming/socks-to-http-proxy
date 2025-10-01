@@ -117,20 +117,33 @@ impl BufferPool {
             &self.small_buffers
         };
 
-        if let Some(mut buffer) = pool.pop() {
-            // Buffer was zeroed on return, capacity is preserved
-            // Just restore the length without zeroing again (optimization)
-            unsafe {
-                // SAFETY: The buffer was zeroed when returned to the pool,
-                // so all bytes up to capacity are initialized to 0.
-                // We're just restoring the length to the expected size.
-                buffer.set_len(size);
+        while let Some(buffer) = pool.pop() {
+            if let Some(buffer) = Self::prepare_buffer(buffer, size) {
+                return buffer;
             }
-            return buffer;
         }
 
         // Create new buffer if pool is empty
         vec![0u8; size]
+    }
+
+    fn prepare_buffer(mut buffer: Vec<u8>, expected_size: usize) -> Option<Vec<u8>> {
+        let capacity = buffer.capacity();
+        if capacity < expected_size || capacity > expected_size * 2 {
+            return None;
+        }
+
+        debug_assert!(
+            capacity >= expected_size && capacity <= expected_size * 2,
+            "buffer capacity out of expected range"
+        );
+
+        buffer.truncate(expected_size);
+        unsafe {
+            buffer.set_len(expected_size);
+        }
+
+        Some(buffer)
     }
 
     /// Return a buffer to the pool for reuse
@@ -235,10 +248,12 @@ mod tests {
         // Test small buffer
         let small_buf = pool.get_buffer(false);
         assert_eq!(small_buf.len(), 8192);
+        assert!(small_buf.capacity() >= 8192);
 
         // Test large buffer
         let large_buf = pool.get_buffer(true);
         assert_eq!(large_buf.len(), 16384);
+        assert!(large_buf.capacity() >= 16384);
 
         // Return buffers
         pool.return_buffer(small_buf, false);
@@ -249,7 +264,9 @@ mod tests {
         let reused_large = pool.get_buffer(true);
 
         assert_eq!(reused_small.len(), 8192);
+        assert!(reused_small.capacity() >= 8192);
         assert_eq!(reused_large.len(), 16384);
+        assert!(reused_large.capacity() >= 16384);
     }
 
     #[test]
@@ -332,14 +349,54 @@ mod tests {
         // Test global convenience functions
         let small_buf = get_buffer(false);
         assert_eq!(small_buf.len(), 8192);
+        assert!(small_buf.capacity() >= 8192);
 
         let large_buf = get_buffer(true);
         assert_eq!(large_buf.len(), 16384);
+        assert!(large_buf.capacity() >= 16384);
 
         return_buffer(small_buf, false);
         return_buffer(large_buf, true);
 
         let stats = get_pool_stats();
         assert!(stats.small_buffers_available > 0 || stats.large_buffers_available > 0);
+    }
+
+    #[test]
+    fn test_reused_buffer_has_correct_length() {
+        let pool = BufferPool::new();
+
+        let mut buffer = pool.get_buffer(false);
+        assert_eq!(buffer.len(), 8192);
+
+        // Write some data into the buffer to simulate usage
+        buffer[0] = 42;
+        buffer[8191] = 99;
+
+        pool.return_buffer(buffer, false);
+
+        let reused = pool.get_buffer(false);
+        assert_eq!(reused.len(), 8192);
+        assert!(reused.capacity() >= 8192);
+        // Buffer should be zeroed by return_buffer but restored without additional zeroing here
+        assert_eq!(reused[0], 0);
+        assert_eq!(reused[8191], 0);
+    }
+
+    #[test]
+    fn test_get_buffer_handles_unexpected_capacity() {
+        let pool = BufferPool::new();
+
+        // Manually push a buffer with the wrong capacity into the small buffer stack.
+        let mut wrong_capacity = Vec::with_capacity(1024);
+        unsafe {
+            wrong_capacity.set_len(1024);
+        }
+        assert!(pool.small_buffers.push(wrong_capacity));
+
+        // The helper should detect the mismatch and allocate a fresh buffer instead of reusing it.
+        let buffer = pool.get_buffer(false);
+        assert_eq!(buffer.len(), 8192);
+        assert!(buffer.capacity() >= 8192);
     }
 }
