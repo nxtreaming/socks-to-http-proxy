@@ -616,8 +616,8 @@ async fn proxy(
         {
             Ok(stream) => stream,
             Err(e) => {
-                if let Some(mut guard) = connection_guard.take() {
-                    guard.decrement();
+                if let Some(guard) = connection_guard.take() {
+                    drop(guard);
                 }
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 return Ok(error_response(
@@ -668,8 +668,8 @@ async fn proxy(
                     },
                     Err(e) => {
                         conn_handle.abort();
-                        if let Some(mut guard) = connection_guard.take() {
-                            guard.decrement();
+                        if let Some(guard) = connection_guard.take() {
+                            drop(guard);
                         }
                         let remaining = ConnectionGuard::active_count();
                         warn!("HTTP #{} connection error, {} active", conn_id, remaining);
@@ -680,8 +680,8 @@ async fn proxy(
             _ = &mut idle_timer => {
                 // Timeout reached - abort the connection
                 conn_handle.abort();
-                if let Some(mut guard) = connection_guard.take() {
-                    guard.decrement();
+                if let Some(guard) = connection_guard.take() {
+                    drop(guard);
                 }
                 let remaining = ConnectionGuard::active_count();
                 warn!(
