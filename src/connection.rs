@@ -1,6 +1,7 @@
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::RwLock;
 
 /// Global counter for tracking active SOCKS5 connections
 pub static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -62,29 +63,31 @@ impl Drop for ConnectionGuard {
 
 /// Per-IP connection tracking for rate limiting
 pub struct IpConnectionTracker {
-    connections: DashMap<IpAddr, usize>,
+    connections: RwLock<HashMap<IpAddr, usize>>,
 }
 
 impl IpConnectionTracker {
     /// Create a new IP connection tracker
     pub fn new() -> Self {
         Self {
-            connections: DashMap::new(),
+            connections: RwLock::new(HashMap::new()),
         }
     }
 
     /// Increment connection count for an IP address
     #[cfg(test)]
-    pub fn increment(&self, ip: IpAddr) -> usize {
-        let mut entry = self.connections.entry(ip).or_insert(0);
+    pub async fn increment(&self, ip: IpAddr) -> usize {
+        let mut connections = self.connections.write().await;
+        let entry = connections.entry(ip).or_insert(0);
         *entry += 1;
         *entry
     }
 
     /// Try to increment connection count if it doesn't exceed the limit
     /// Returns Some(new_count) if successful, None if limit would be exceeded
-    pub fn try_increment(&self, ip: IpAddr, limit: usize) -> Option<usize> {
-        let mut entry = self.connections.entry(ip).or_insert(0);
+    pub async fn try_increment(&self, ip: IpAddr, limit: usize) -> Option<usize> {
+        let mut connections = self.connections.write().await;
+        let entry = connections.entry(ip).or_insert(0);
         if *entry >= limit {
             return None;
         }
@@ -93,35 +96,38 @@ impl IpConnectionTracker {
     }
 
     /// Decrement connection count for an IP address
-    pub fn decrement(&self, ip: IpAddr) {
-        if let Some(mut entry) = self.connections.get_mut(&ip) {
+    pub async fn decrement(&self, ip: IpAddr) {
+        let mut connections = self.connections.write().await;
+        if let Some(entry) = connections.get_mut(&ip) {
             if *entry > 0 {
                 *entry -= 1;
             }
             if *entry == 0 {
-                drop(entry); // Release the lock before removing
-                self.connections.remove(&ip);
+                connections.remove(&ip);
             }
         }
     }
 
     /// Get current connection count for an IP address
-    pub fn get_count(&self, ip: IpAddr) -> usize {
-        self.connections.get(&ip).map(|e| *e).unwrap_or(0)
+    pub async fn get_count(&self, ip: IpAddr) -> usize {
+        let connections = self.connections.read().await;
+        connections.get(&ip).copied().unwrap_or(0)
     }
 
     /// Get total number of tracked IPs
     #[allow(dead_code)]
-    pub fn tracked_ips_count(&self) -> usize {
-        self.connections.len()
+    pub async fn tracked_ips_count(&self) -> usize {
+        let connections = self.connections.read().await;
+        connections.len()
     }
 
     /// Clean up IPs with zero connections (periodic maintenance)
     #[allow(dead_code)]
-    pub fn cleanup_zero_connections(&self) -> usize {
-        let before = self.connections.len();
-        self.connections.retain(|_, &mut count| count > 0);
-        before - self.connections.len()
+    pub async fn cleanup_zero_connections(&self) -> usize {
+        let mut connections = self.connections.write().await;
+        let before = connections.len();
+        connections.retain(|_, count| *count > 0);
+        before - connections.len()
     }
 }
 
@@ -189,49 +195,49 @@ mod tests {
         assert_eq!(ConnectionGuard::active_count(), 0);
     }
 
-    #[test]
-    fn test_ip_connection_tracker() {
+    #[tokio::test]
+    async fn test_ip_connection_tracker() {
         let tracker = IpConnectionTracker::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
         // Test increment
-        let count1 = tracker.increment(ip);
+        let count1 = tracker.increment(ip).await;
         assert_eq!(count1, 1);
-        assert_eq!(tracker.get_count(ip), 1);
+        assert_eq!(tracker.get_count(ip).await, 1);
 
-        let count2 = tracker.increment(ip);
+        let count2 = tracker.increment(ip).await;
         assert_eq!(count2, 2);
-        assert_eq!(tracker.get_count(ip), 2);
+        assert_eq!(tracker.get_count(ip).await, 2);
 
         // Test decrement
-        tracker.decrement(ip);
-        assert_eq!(tracker.get_count(ip), 1);
+        tracker.decrement(ip).await;
+        assert_eq!(tracker.get_count(ip).await, 1);
 
-        tracker.decrement(ip);
-        assert_eq!(tracker.get_count(ip), 0);
+        tracker.decrement(ip).await;
+        assert_eq!(tracker.get_count(ip).await, 0);
 
         // IP should be removed when count reaches 0
-        tracker.decrement(ip); // Should not panic
-        assert_eq!(tracker.get_count(ip), 0);
+        tracker.decrement(ip).await; // Should not panic
+        assert_eq!(tracker.get_count(ip).await, 0);
     }
 
-    #[test]
-    fn test_try_increment_limit_behavior() {
+    #[tokio::test]
+    async fn test_try_increment_limit_behavior() {
         let tracker = IpConnectionTracker::new();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let limit = 2;
 
         // First two increments should succeed up to the limit
-        assert_eq!(tracker.try_increment(ip, limit), Some(1));
-        assert_eq!(tracker.try_increment(ip, limit), Some(2));
+        assert_eq!(tracker.try_increment(ip, limit).await, Some(1));
+        assert_eq!(tracker.try_increment(ip, limit).await, Some(2));
 
         // Next increment should be rejected (would exceed limit)
-        assert_eq!(tracker.try_increment(ip, limit), None);
-        assert_eq!(tracker.get_count(ip), 2);
+        assert_eq!(tracker.try_increment(ip, limit).await, None);
+        assert_eq!(tracker.get_count(ip).await, 2);
 
         // After decrement, increment should succeed again
-        tracker.decrement(ip);
-        assert_eq!(tracker.try_increment(ip, limit), Some(2));
+        tracker.decrement(ip).await;
+        assert_eq!(tracker.try_increment(ip, limit).await, Some(2));
     }
 
     #[test]
