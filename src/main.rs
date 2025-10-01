@@ -125,6 +125,67 @@ where
     }
 }
 
+// RAII wrapper for connection cleanup that owns both guard and handle
+struct ConnectionCleanup {
+    _connection_guard: ConnectionGuard,
+    _conn_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectionCleanup {
+    fn new(guard: ConnectionGuard, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            _connection_guard: guard,
+            _conn_handle: handle,
+        }
+    }
+}
+
+// Note: We don't implement Drop because we want the conn_handle to complete naturally.
+// The JoinHandle will be dropped when ConnectionCleanup is dropped, which detaches
+// the task and allows it to continue running in the background until completion.
+// The ConnectionGuard will be automatically dropped, decrementing the counter.
+
+// Body wrapper that owns ConnectionCleanup for proper cleanup
+// This eliminates the need for a separate spawned task to wait for cleanup
+#[pin_project]
+struct GuardedBody<B> {
+    #[pin]
+    inner: B,
+    _cleanup: ConnectionCleanup,
+}
+
+impl<B> GuardedBody<B> {
+    fn new(inner: B, guard: ConnectionGuard, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            inner,
+            _cleanup: ConnectionCleanup::new(guard, handle),
+        }
+    }
+}
+
+impl<B> Body for GuardedBody<B>
+where
+    B: Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=warn"));
@@ -626,32 +687,21 @@ async fn proxy(
             }
         };
 
-        // We are done initiating the request. Keep the connection driver running
-        // in the background until it finishes to ensure the response body is fully
-        // streamed and resources are cleaned up properly. In hyper's (sender, conn)
-        // model, `conn` is the I/O driver; keeping it alive is sufficient—no need
-        // to await sender.closed() here.
-
-        // Spawn a task to handle connection cleanup properly
-        // Important: We must not drop this task handle to ensure cleanup happens
-        tokio::spawn(async move {
-            // Wait for connection driver to finish to ensure proper cleanup
-            let _ = conn_handle.await; // wait for connection driver to finish
-            drop(connection_guard); // RAII drop -> decrement
-        });
-        // Intentionally do not abort conn_handle; it will finish when the connection shuts down.
-
-        // Count HTTP response body bytes (proxy -> client)
+        // Wrap the response body with counting and guard ownership
+        // The GuardedBody will own the ConnectionGuard and conn_handle,
+        // ensuring proper cleanup when the body is dropped without needing
+        // a separate spawned task. This reduces scheduler overhead.
         let resp = resp.map(|b| {
-            CountingBody {
+            let counting_body = CountingBody {
                 inner: b,
                 counters: Arc::clone(&traffic_counters),
                 dir: CountDir::Tx,
-            }
-            .boxed()
+            };
+            GuardedBody::new(counting_body, connection_guard, conn_handle).boxed()
         });
 
         // Return the response body as-is; hyper will forward it to the client
+        // The ConnectionGuard will be automatically dropped when the body finishes
         Ok(resp)
     }
 }

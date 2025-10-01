@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 /// Global counter for tracking active SOCKS5 connections
 pub static ACTIVE_SOCKS5_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -63,81 +62,66 @@ impl Drop for ConnectionGuard {
 
 /// Per-IP connection tracking for rate limiting
 pub struct IpConnectionTracker {
-    connections: Mutex<HashMap<IpAddr, usize>>,
+    connections: DashMap<IpAddr, usize>,
 }
 
 impl IpConnectionTracker {
     /// Create a new IP connection tracker
     pub fn new() -> Self {
         Self {
-            connections: Mutex::new(HashMap::new()),
+            connections: DashMap::new(),
         }
-    }
-
-    /// Helper to lock the connections map with poisoning recovery
-    fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
-        self.connections.lock().unwrap_or_else(|poisoned| {
-            // Recover from poisoned mutex by clearing potentially corrupted state
-            let mut guard = poisoned.into_inner();
-            guard.clear();
-            guard
-        })
     }
 
     /// Increment connection count for an IP address
     #[cfg(test)]
     pub fn increment(&self, ip: IpAddr) -> usize {
-        let mut connections = self.lock_connections();
-        let count = connections.entry(ip).or_insert(0);
-        *count += 1;
-        *count
+        let mut entry = self.connections.entry(ip).or_insert(0);
+        *entry += 1;
+        *entry
     }
 
     /// Try to increment connection count if it doesn't exceed the limit
     /// Returns Some(new_count) if successful, None if limit would be exceeded
     pub fn try_increment(&self, ip: IpAddr, limit: usize) -> Option<usize> {
-        let mut connections = self.lock_connections();
-        let count = connections.entry(ip).or_insert(0);
-        if *count >= limit {
+        let mut entry = self.connections.entry(ip).or_insert(0);
+        if *entry >= limit {
             return None;
         }
-        *count += 1;
-        Some(*count)
+        *entry += 1;
+        Some(*entry)
     }
 
     /// Decrement connection count for an IP address
     pub fn decrement(&self, ip: IpAddr) {
-        let mut connections = self.lock_connections();
-        if let Some(count) = connections.get_mut(&ip) {
-            if *count > 0 {
-                *count -= 1;
+        if let Some(mut entry) = self.connections.get_mut(&ip) {
+            if *entry > 0 {
+                *entry -= 1;
             }
-            if *count == 0 {
-                connections.remove(&ip);
+            if *entry == 0 {
+                drop(entry); // Release the lock before removing
+                self.connections.remove(&ip);
             }
         }
     }
 
     /// Get current connection count for an IP address
     pub fn get_count(&self, ip: IpAddr) -> usize {
-        let connections = self.lock_connections();
-        connections.get(&ip).copied().unwrap_or(0)
+        self.connections.get(&ip).map(|e| *e).unwrap_or(0)
     }
 
     /// Get total number of tracked IPs
     #[allow(dead_code)]
     pub fn tracked_ips_count(&self) -> usize {
-        let connections = self.lock_connections();
-        connections.len()
+        self.connections.len()
     }
 
     /// Clean up IPs with zero connections (periodic maintenance)
     #[allow(dead_code)]
     pub fn cleanup_zero_connections(&self) -> usize {
-        let mut connections = self.lock_connections();
-        let before = connections.len();
-        connections.retain(|_, &mut count| count > 0);
-        before - connections.len()
+        let before = self.connections.len();
+        self.connections.retain(|_, &mut count| count > 0);
+        before - self.connections.len()
     }
 }
 

@@ -1,29 +1,108 @@
-use std::sync::Mutex;
+use crossbeam_utils::CachePadded;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const MAX_POOL_SIZE: usize = 100;
+
+/// Lock-free buffer pool using a simple stack-based approach
+struct LockFreeBufferStack {
+    buffers: Vec<CachePadded<AtomicUsize>>, // Store buffer pointers as usize
+    top: AtomicUsize,
+}
+
+impl LockFreeBufferStack {
+    fn new() -> Self {
+        let mut buffers = Vec::with_capacity(MAX_POOL_SIZE);
+        for _ in 0..MAX_POOL_SIZE {
+            buffers.push(CachePadded::new(AtomicUsize::new(0)));
+        }
+        Self {
+            buffers,
+            top: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, buffer: Vec<u8>) -> bool {
+        let current_top = self.top.load(Ordering::Relaxed);
+        if current_top >= MAX_POOL_SIZE {
+            return false; // Pool is full
+        }
+
+        // Try to increment top
+        match self.top.compare_exchange(
+            current_top,
+            current_top + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                // Successfully claimed a slot, store the buffer
+                let ptr = Box::into_raw(Box::new(buffer)) as usize;
+                self.buffers[current_top].store(ptr, Ordering::Release);
+                true
+            }
+            Err(_) => false, // Another thread beat us, drop the buffer
+        }
+    }
+
+    fn pop(&self) -> Option<Vec<u8>> {
+        loop {
+            let current_top = self.top.load(Ordering::Relaxed);
+            if current_top == 0 {
+                return None; // Pool is empty
+            }
+
+            // Try to decrement top
+            match self.top.compare_exchange(
+                current_top,
+                current_top - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // Successfully claimed a buffer slot
+                    let ptr = self.buffers[current_top - 1].swap(0, Ordering::Acquire);
+                    if ptr != 0 {
+                        let buffer = unsafe { *Box::from_raw(ptr as *mut Vec<u8>) };
+                        return Some(buffer);
+                    }
+                    // Pointer was null (shouldn't happen in normal operation)
+                    // This indicates a bug, but we return None to avoid infinite loop
+                    return None;
+                }
+                Err(_) => continue, // Another thread beat us, try again
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.top.load(Ordering::Relaxed)
+    }
+
+    fn clear(&self) {
+        while self.pop().is_some() {}
+    }
+}
+
+impl Drop for LockFreeBufferStack {
+    fn drop(&mut self) {
+        // Clean up any remaining buffers
+        self.clear();
+    }
+}
 
 /// Buffer pool for memory optimization
 pub struct BufferPool {
-    small_buffers: Mutex<Vec<Vec<u8>>>, // 8KB buffers
-    large_buffers: Mutex<Vec<Vec<u8>>>, // 16KB buffers
+    small_buffers: LockFreeBufferStack, // 8KB buffers
+    large_buffers: LockFreeBufferStack, // 16KB buffers
 }
 
 impl BufferPool {
     /// Create a new buffer pool
     pub fn new() -> Self {
         Self {
-            small_buffers: Mutex::new(Vec::new()),
-            large_buffers: Mutex::new(Vec::new()),
+            small_buffers: LockFreeBufferStack::new(),
+            large_buffers: LockFreeBufferStack::new(),
         }
-    }
-
-    /// Helper to lock a buffer pool with poisoning recovery
-    fn lock_pool(&self, large: bool) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
-        let pool = if large { &self.large_buffers } else { &self.small_buffers };
-        pool.lock().unwrap_or_else(|poisoned| {
-            // Recover from poisoned mutex by clearing the pool
-            let mut guard = poisoned.into_inner();
-            guard.clear();
-            guard
-        })
     }
 
     /// Get a buffer from the pool or create a new one
@@ -32,11 +111,21 @@ impl BufferPool {
     /// * `large` - If true, returns a 16KB buffer; otherwise returns an 8KB buffer
     pub fn get_buffer(&self, large: bool) -> Vec<u8> {
         let size = if large { 16384 } else { 8192 };
-        let mut buffers = self.lock_pool(large);
+        let pool = if large {
+            &self.large_buffers
+        } else {
+            &self.small_buffers
+        };
 
-        if let Some(mut buffer) = buffers.pop() {
-            buffer.clear();
-            buffer.resize(size, 0);
+        if let Some(mut buffer) = pool.pop() {
+            // Buffer was zeroed on return, capacity is preserved
+            // Just restore the length without zeroing again (optimization)
+            unsafe {
+                // SAFETY: The buffer was zeroed when returned to the pool,
+                // so all bytes up to capacity are initialized to 0.
+                // We're just restoring the length to the expected size.
+                buffer.set_len(size);
+            }
             return buffer;
         }
 
@@ -53,28 +142,33 @@ impl BufferPool {
         // Only return buffers that are the expected size and capacity to avoid memory bloat
         let expected_size = if large { 16384 } else { 8192 };
 
-        // Reject buffers with wrong size or excessive capacity
-        if buffer.len() != expected_size || buffer.capacity() > expected_size * 2 {
+        // Reject buffers with wrong capacity
+        if buffer.capacity() < expected_size || buffer.capacity() > expected_size * 2 {
             return;
         }
 
-        // Clear the buffer to avoid leaking data between connections
+        // Zero the buffer ONCE on return to avoid leaking data between connections
+        // This is the only place where we zero the buffer (optimization)
         buffer.clear();
         buffer.resize(expected_size, 0);
+        // After resize, buffer.len() == expected_size and all bytes are 0
+        // On next checkout, we'll just use set_len() without zeroing again
 
-        let mut buffers = self.lock_pool(large);
-        // Limit pool size to prevent excessive memory usage
-        // Use a reasonable limit based on expected concurrency
-        if buffers.len() < 100 {
-            buffers.push(buffer);
-        }
+        let pool = if large {
+            &self.large_buffers
+        } else {
+            &self.small_buffers
+        };
+
+        // Try to return to pool, drop if pool is full
+        let _ = pool.push(buffer);
     }
 
     /// Get statistics about the buffer pool
     #[allow(dead_code)]
     pub fn stats(&self) -> BufferPoolStats {
-        let small_count = self.lock_pool(false).len();
-        let large_count = self.lock_pool(true).len();
+        let small_count = self.small_buffers.len();
+        let large_count = self.large_buffers.len();
 
         BufferPoolStats {
             small_buffers_available: small_count,
@@ -86,8 +180,8 @@ impl BufferPool {
     /// Clear all buffers from the pool (useful for testing or memory cleanup)
     #[allow(dead_code)]
     pub fn clear(&self) {
-        self.lock_pool(false).clear();
-        self.lock_pool(true).clear();
+        self.small_buffers.clear();
+        self.large_buffers.clear();
     }
 }
 

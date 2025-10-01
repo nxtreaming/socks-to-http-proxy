@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Per-listener traffic counters (bytes)
 #[derive(Debug, Default)]
@@ -26,65 +26,68 @@ impl TrafficCounters {
 }
 
 /// Global registry of traffic counters keyed by listening port
-static TRAFFIC_REGISTRY: std::sync::OnceLock<Mutex<HashMap<u16, Arc<TrafficCounters>>>> = std::sync::OnceLock::new();
+static TRAFFIC_REGISTRY: std::sync::OnceLock<DashMap<u16, Arc<TrafficCounters>>> = std::sync::OnceLock::new();
 
-fn registry() -> &'static Mutex<HashMap<u16, Arc<TrafficCounters>>> {
-    TRAFFIC_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Helper to lock the registry with poisoning recovery
-fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<u16, Arc<TrafficCounters>>> {
-    match registry().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            // Recover from poisoned mutex
-            poisoned.into_inner()
-        }
-    }
+fn registry() -> &'static DashMap<u16, Arc<TrafficCounters>> {
+    TRAFFIC_REGISTRY.get_or_init(|| DashMap::new())
 }
 
 /// Get or create counters for a given listening port
 pub fn get_counters_for_port(port: u16) -> Arc<TrafficCounters> {
-    let mut map = lock_registry();
-    map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default())).clone()
+    registry()
+        .entry(port)
+        .or_insert_with(|| Arc::new(TrafficCounters::default()))
+        .clone()
 }
 
 /// Reset counters for a given port
 pub fn reset_port(port: u16) {
-    let mut map = lock_registry();
-    let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
+    let entry = registry()
+        .entry(port)
+        .or_insert_with(|| Arc::new(TrafficCounters::default()));
     entry.reset();
 }
 
 /// Snapshot of current counters for a port
 pub fn snapshot(port: u16) -> Option<(u64, u64)> {
-    let map = lock_registry();
-    map.get(&port).map(|c| (c.rx(), c.tx()))
+    registry().get(&port).map(|c| (c.rx(), c.tx()))
 }
 
 /// Snapshot of all counters (port, rx, tx)
 #[allow(dead_code)]
 pub fn all_snapshots() -> Vec<(u16, u64, u64)> {
-    let map = lock_registry();
-    map.iter().map(|(p, c)| (*p, c.rx(), c.tx())).collect()
+    registry()
+        .iter()
+        .map(|entry| (*entry.key(), entry.rx(), entry.tx()))
+        .collect()
 }
 
 /// Load counters from a simple text file: lines of "port\trx\ttx"
 pub fn load_from_file(path: &Path) -> io::Result<()> {
-    if !path.exists() { return Ok(()); }
+    if !path.exists() {
+        return Ok(());
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
-    let mut map = lock_registry();
+    let map = registry();
     for line in reader.lines() {
         let line = line?;
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
+        if parts.len() < 3 {
+            continue;
+        }
         if let (Ok(port), Ok(rx), Ok(tx)) = (
-            parts[0].parse::<u16>(), parts[1].parse::<u64>(), parts[2].parse::<u64>()
+            parts[0].parse::<u16>(),
+            parts[1].parse::<u64>(),
+            parts[2].parse::<u64>(),
         ) {
-            let entry = map.entry(port).or_insert_with(|| Arc::new(TrafficCounters::default()));
+            let entry = map
+                .entry(port)
+                .or_insert_with(|| Arc::new(TrafficCounters::default()));
             entry.set(rx, tx);
         }
     }

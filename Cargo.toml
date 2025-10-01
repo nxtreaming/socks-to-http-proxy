@@ -25,3 +25,5 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-au
 base64 = "0.22"
 thiserror = "1.0"
 pin-project = "1.1"
+dashmap = "6.1.0"
+crossbeam-utils = "0.8.21"
