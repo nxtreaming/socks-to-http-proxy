@@ -17,8 +17,8 @@ use crate::connection::{
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
-use crate::traffic::{get_counters_for_port, load_from_file, reset_port,save_port_to_file,
-                     snapshot, TrafficCounters};
+use crate::traffic::{get_counters_for_port, load_from_file, reset_port,
+                     save_port_to_file, snapshot, TrafficCounters};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use hyper::body::{Body, Frame, SizeHint};
