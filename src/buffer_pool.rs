@@ -151,6 +151,64 @@ pub async fn get_pool_stats() -> BufferPoolStats {
     get_buffer_pool().stats().await
 }
 
+/// RAII lease that returns the buffer to the global pool on drop
+#[derive(Debug)]
+pub struct BufferLease {
+    buffer: Option<Vec<u8>>, // kept as Vec<u8> to reuse capacity and avoid reallocs
+    large: bool,
+}
+
+impl BufferLease {
+    /// Create a new lease by pulling a buffer from the global pool
+    pub async fn new(large: bool) -> Self {
+        let buf = get_buffer(large).await;
+        Self { buffer: Some(buf), large }
+    }
+
+    /// Access the underlying buffer as a mutable slice
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buffer
+            .as_mut()
+            .expect("buffer should be present")
+            .as_mut_slice()
+    }
+
+    /// Length of the buffer (always the configured size for small/large)
+    pub fn len(&self) -> usize {
+        self.buffer
+            .as_ref()
+            .expect("buffer should be present")
+            .len()
+    }
+
+    /// Capacity of the buffer
+    pub fn capacity(&self) -> usize {
+        self.buffer
+            .as_ref()
+            .expect("buffer should be present")
+            .capacity()
+    }
+}
+
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let large = self.large;
+            // Return the buffer asynchronously without blocking drop
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    return_buffer(buffer, large).await;
+                });
+            }
+        }
+    }
+}
+
+/// Convenience function to obtain a leased buffer
+pub async fn lease_buffer(large: bool) -> BufferLease {
+    BufferLease::new(large).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@ mod session;
 mod socks;
 mod traffic;
 
-use crate::buffer_pool::{get_buffer, return_buffer};
+use crate::buffer_pool::lease_buffer;
 use crate::config::{Cli, ProxyConfig};
 use crate::connection::{
     get_ip_tracker, is_backlog_threshold_exceeded, is_memory_pressure_high, ConnectionGuard,
@@ -50,37 +50,6 @@ use pin_project::{pin_project, pinned_drop};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-/// RAII guard for buffer management
-struct BufferGuard {
-    buffer: Option<Vec<u8>>,
-    large: bool,
-}
-
-impl BufferGuard {
-    fn new(buffer: Vec<u8>, large: bool) -> Self {
-        Self {
-            buffer: Some(buffer),
-            large,
-        }
-    }
-
-    fn take(&mut self) -> Option<Vec<u8>> {
-        self.buffer.take()
-    }
-}
-
-impl Drop for BufferGuard {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            let large = self.large;
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    return_buffer(buffer, large).await;
-                });
-            }
-        }
-    }
-}
 
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
@@ -452,41 +421,8 @@ async fn proxy(
     sessionid: Option<String>,
     traffic_counters: Arc<TrafficCounters>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    // Early return for disabled authentication
-    if config.no_httpauth {
-        // Authentication is disabled, proceed
-    } else {
-        let headers = req.headers();
-
-        // Early return if no authorization header
-        let auth_header = match headers.get(hyper::header::PROXY_AUTHORIZATION) {
-            Some(header) => header,
-            None => {
-                // When the request does not contain a Proxy-Authorization header,
-                // send a 407 response with Proxy-Authenticate header
-                return Ok(proxy_auth_required_response(
-                    "Proxy authentication required",
-                ));
-            }
-        };
-
-        // Early return for authentication failure
-        match http_basic.as_ref() {
-            Some(expected_auth) => {
-                if auth_header != expected_auth {
-                    warn!("Proxy authentication failed (invalid or mismatched credentials)");
-                    return Ok(proxy_auth_required_response(
-                        "Proxy authentication required",
-                    ));
-                }
-            }
-            None => {
-                warn!("HTTP Basic auth not configured but required");
-                return Ok(proxy_auth_required_response(
-                    "Proxy authentication required",
-                ));
-            }
-        }
+    if let Some(resp) = check_proxy_auth(req.headers(), http_basic.as_ref(), config.no_httpauth) {
+        return Ok(resp);
     }
     // Management endpoints (require auth if enabled)
     // Reset first
@@ -777,6 +713,46 @@ fn get_stats_path(config: &ProxyConfig) -> PathBuf {
     }
 }
 
+/// Validate proxy authentication and return an early response if unauthorized
+fn check_proxy_auth(
+    headers: &http::HeaderMap,
+    http_basic: &Option<HeaderValue>,
+    no_httpauth: bool,
+) -> Option<Response<BoxBody<Bytes, hyper::Error>>> {
+    if no_httpauth {
+        return None;
+    }
+
+    // Require Proxy-Authorization header
+    let auth_header = match headers.get(hyper::header::PROXY_AUTHORIZATION) {
+        Some(h) => h,
+        None => {
+            return Some(proxy_auth_required_response(
+                "Proxy authentication required",
+            ));
+        }
+    };
+
+    match http_basic {
+        Some(expected) => {
+            if auth_header != expected {
+                warn!("Proxy authentication failed (invalid or mismatched credentials)");
+                Some(proxy_auth_required_response(
+                    "Proxy authentication required",
+                ))
+            } else {
+                None
+            }
+        }
+        None => {
+            warn!("HTTP Basic auth not configured but required");
+            Some(proxy_auth_required_response(
+                "Proxy authentication required",
+            ))
+        }
+    }
+}
+
 /// Helper function to check domain access
 fn check_domain_access(
     allowed_domains: &Option<HashSet<String>>,
@@ -798,6 +774,7 @@ fn check_domain_access(
 }
 
 async fn tunnel(
+
     upgraded: Upgraded,
     addr: String,
     socks_connector: Arc<SocksConnector>,
@@ -846,26 +823,22 @@ async fn tunnel(
 
     // Use buffer pool for memory optimization with RAII guards
     let use_large_buffers = idle_timeout > 300;
-    let client_buf = get_buffer(use_large_buffers).await;
-    let server_buf = get_buffer(use_large_buffers).await;
-    let mut client_guard = BufferGuard::new(client_buf, use_large_buffers);
-    let mut server_guard = BufferGuard::new(server_buf, use_large_buffers);
-    let mut client_buf = client_guard.take().unwrap();
-    let mut server_buf = server_guard.take().unwrap();
+    let mut client_lease = lease_buffer(use_large_buffers).await;
+    let mut server_lease = lease_buffer(use_large_buffers).await;
     let idle = tokio::time::sleep(timeout);
     tokio::pin!(idle);
     let mut error: Option<color_eyre::eyre::Error> = None;
 
     loop {
         tokio::select! {
-            res = client.read(&mut client_buf) => {
+            res = client.read(client_lease.as_mut_slice()) => {
                 match res {
                     Ok(0) => {
                         // Client connection closed normally
                         break;
                     }
                     Ok(n) => {
-                        if let Err(e) = server.write_all(&client_buf[..n]).await {
+                        if let Err(e) = server.write_all(&client_lease.as_mut_slice()[..n]).await {
                             warn!("Tunnel #{} server write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
@@ -880,14 +853,14 @@ async fn tunnel(
                     }
                 }
             }
-            res = server.read(&mut server_buf) => {
+            res = server.read(server_lease.as_mut_slice()) => {
                 match res {
                     Ok(0) => {
                         // Server connection closed normally
                         break;
                     }
                     Ok(n) => {
-                        if let Err(e) = client.write_all(&server_buf[..n]).await {
+                        if let Err(e) = client.write_all(&server_lease.as_mut_slice()[..n]).await {
                             warn!("Tunnel #{} client write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
@@ -928,11 +901,6 @@ async fn tunnel(
 
     drop(server);
     drop(client);
-
-    // Return buffers to pool for reuse via RAII guards
-    let _client_guard = BufferGuard::new(client_buf, use_large_buffers);
-    let _server_guard = BufferGuard::new(server_buf, use_large_buffers);
-    // Guards will automatically return buffers when dropped
 
     // connection_guard will be automatically decremented when dropped
     let remaining = ConnectionGuard::active_count();
