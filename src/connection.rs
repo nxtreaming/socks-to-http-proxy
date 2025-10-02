@@ -174,9 +174,12 @@ pub fn is_backlog_threshold_exceeded() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
     use std::net::Ipv4Addr;
 
     #[test]
+    #[serial]
     fn test_connection_guard() {
         // Reset counter for test
         ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
@@ -191,6 +194,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_connection_guard_manual_decrement() {
         // Reset counter for test
         ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
@@ -289,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_connection_guard_respects_limit() {
         ACTIVE_SOCKS5_CONNECTIONS.store(MAX_CONCURRENT_CONNECTIONS, Ordering::Relaxed);
 
