@@ -1019,4 +1019,208 @@ mod tests {
 
         assert_eq!(ConnectionGuard::active_count(), 0);
     }
+
+    #[tokio::test]
+    async fn stats_endpoints_without_auth() {
+        use hyper::client::conn::http1 as client_http1;
+        use hyper::Request;
+        use hyper_util::rt::TokioIo;
+        use http_body_util::BodyExt;
+        use hyper::server::conn::http1;
+        use std::sync::Arc;
+
+        // Prepare config with auth disabled
+        let port = 18081u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(123, 456);
+
+        let config = Arc::new(ProxyConfig {
+            listen_addr: std::net::SocketAddr::from(([127,0,0,1], port)),
+            socks_addr: std::net::SocketAddr::from(([127,0,0,1], 1080)),
+            allowed_domains: None,
+            http_basic_auth: None,
+            no_httpauth: true,
+            idle_timeout: 60,
+            conn_per_ip: 100,
+            force_close: true,
+            soax_settings: crate::config::SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
+            vendor_password: None,
+            socks_auth: None,
+            stats_dir: Some(std::env::temp_dir().join("sthp_test").to_string_lossy().to_string()),
+            stats_interval: 60,
+            connpnt_settings: crate::config::ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+        });
+
+        let socks = Arc::new(
+            crate::socks::SocksConnectorBuilder::new()
+                .socks_addr(config.socks_addr)
+                .build()
+                .expect("builder should succeed"),
+        );
+        let http_basic = Arc::new(config.http_basic_auth.clone());
+        let allowed = Arc::new(config.allowed_domains.clone());
+        let counters_arc = counters.clone();
+
+        // In-memory client/server IO pair
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+
+        // Spawn server side
+        let server = tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                proxy(
+                    req,
+                    Arc::clone(&socks),
+                    Arc::clone(&http_basic),
+                    Arc::clone(&allowed),
+                    Arc::clone(&config),
+                    None,
+                    Arc::clone(&counters_arc),
+                )
+            });
+            if let Err(e) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                panic!("server error: {}", e);
+            }
+        });
+
+        // Client handshake
+        let (mut sender, conn) = client_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake");
+        let client_task = tokio::spawn(async move { let _ = conn.await; });
+
+        // GET /stats should return current counters
+        let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
+        let mut resp = sender.send_request(req).await.expect("send stats");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"rx\":123"));
+        assert!(body.contains("\"tx\":456"));
+
+        // POST /stats/reset should zero the counters
+        let req = Request::builder().method("POST").uri("/stats/reset").body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.expect("send reset");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let snapshot_after = snapshot(port).await.unwrap_or((0,0));
+        assert_eq!(snapshot_after, (0,0));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stats_endpoints_with_auth() {
+        use hyper::client::conn::http1 as client_http1;
+        use hyper::Request;
+        use hyper_util::rt::TokioIo;
+        use http_body_util::BodyExt;
+        use base64::Engine;
+        use hyper::server::conn::http1;
+        use std::sync::Arc;
+
+        // Prepare config with auth enabled
+        let port = 18082u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(42, 24);
+
+        let user = "user"; let pass = "pass";
+        let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass)));
+        let auth_header = HeaderValue::from_str(&expected).unwrap();
+
+        let config = Arc::new(ProxyConfig {
+            listen_addr: std::net::SocketAddr::from(([127,0,0,1], port)),
+            socks_addr: std::net::SocketAddr::from(([127,0,0,1], 1080)),
+            allowed_domains: None,
+            http_basic_auth: Some(auth_header.clone()),
+            no_httpauth: false,
+            idle_timeout: 60,
+            conn_per_ip: 100,
+            force_close: true,
+            soax_settings: crate::config::SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
+            vendor_password: None,
+            socks_auth: None,
+            stats_dir: Some(std::env::temp_dir().join("sthp_test").to_string_lossy().to_string()),
+            stats_interval: 60,
+            connpnt_settings: crate::config::ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+        });
+
+        let socks = Arc::new(
+            crate::socks::SocksConnectorBuilder::new()
+                .socks_addr(config.socks_addr)
+                .build()
+                .expect("builder should succeed"),
+        );
+        let http_basic = Arc::new(config.http_basic_auth.clone());
+        let allowed = Arc::new(config.allowed_domains.clone());
+        let counters_arc = counters.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+
+        let server = tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                proxy(
+                    req,
+                    Arc::clone(&socks),
+                    Arc::clone(&http_basic),
+                    Arc::clone(&allowed),
+                    Arc::clone(&config),
+                    None,
+                    Arc::clone(&counters_arc),
+                )
+            });
+            if let Err(e) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                panic!("server error: {}", e);
+            }
+        });
+
+        let (mut sender, conn) = client_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake");
+        let client_task = tokio::spawn(async move { let _ = conn.await; });
+
+        // Missing auth -> 407
+        let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.expect("send stats no auth");
+        assert_eq!(resp.status(), http::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+
+        // Wrong auth -> 407
+        let req = Request::builder().method("GET").uri("/stats").header(hyper::header::PROXY_AUTHORIZATION, "Basic d3Jvbmc6d3Jvbmc=")
+            .body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.expect("send stats wrong auth");
+        assert_eq!(resp.status(), http::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert!(resp.headers().get(hyper::header::PROXY_AUTHENTICATE).is_some());
+
+        // Correct auth -> 200 with JSON containing snapshot
+        let req = Request::builder().method("GET").uri("/stats").header(hyper::header::PROXY_AUTHORIZATION, auth_header)
+            .body(Empty::<Bytes>::new()).unwrap();
+        let mut resp = sender.send_request(req).await.expect("send stats ok");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"rx\":42"));
+        assert!(body.contains("\"tx\":24"));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
 }
