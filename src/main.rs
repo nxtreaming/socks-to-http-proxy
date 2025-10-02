@@ -17,8 +17,6 @@ use crate::connection::{
 use crate::domain::is_domain_allowed;
 use crate::session::new_session_id;
 use crate::socks::SocksConnector;
-#[cfg(test)]
-use crate::config::{SoaxSettings, ConnpntSettings};
 
 use crate::traffic::{
     get_counters_for_port, load_from_file, reset_port, save_port_to_file, snapshot, TrafficCounters,
@@ -945,6 +943,8 @@ async fn tunnel(
 
 #[cfg(test)]
 fn base_proxy_config(port: u16) -> ProxyConfig {
+    use crate::config::{SoaxSettings, ConnpntSettings};
+
     ProxyConfig {
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         socks_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1080)),
