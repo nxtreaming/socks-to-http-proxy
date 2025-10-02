@@ -345,7 +345,11 @@ impl ProxyConfig {
         let listen_addr = std::net::SocketAddr::from((args.listen_ip, args.port));
 
         // Convert allowed domains to HashSet
-        let allowed_domains = args.allowed_domains.clone().map(|v| v.into_iter().collect());
+        let allowed_domains = args.allowed_domains.clone().map(|v| {
+            v.into_iter()
+                .map(|pattern| pattern.to_ascii_lowercase())
+                .collect()
+        });
 
         // Extract vendor password (-P) and SOCKS auth separately
         let vendor_password = args.auth.as_ref().and_then(|a| a.password.clone());
