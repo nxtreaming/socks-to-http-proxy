@@ -173,21 +173,6 @@ impl BufferLease {
             .as_mut_slice()
     }
 
-    /// Length of the buffer (always the configured size for small/large)
-    pub fn len(&self) -> usize {
-        self.buffer
-            .as_ref()
-            .expect("buffer should be present")
-            .len()
-    }
-
-    /// Capacity of the buffer
-    pub fn capacity(&self) -> usize {
-        self.buffer
-            .as_ref()
-            .expect("buffer should be present")
-            .capacity()
-    }
 }
 
 impl Drop for BufferLease {
