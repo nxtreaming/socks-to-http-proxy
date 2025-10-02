@@ -749,7 +749,7 @@ fn check_proxy_auth(
     }
 
     // Require Proxy-Authorization header
-    let auth_header = match headers.get(hyper::header::PROXY_AUTHORIZATION) {
+    let auth_header = match headers.get(PROXY_AUTHORIZATION) {
         Some(h) => h,
         None => {
             return Some(proxy_auth_required_response(
@@ -1208,14 +1208,14 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
 
         // Wrong auth -> 407
-        let req = Request::builder().method("GET").uri("/stats").header(hyper::header::PROXY_AUTHORIZATION, "Basic d3Jvbmc6d3Jvbmc=")
+        let req = Request::builder().method("GET").uri("/stats").header(PROXY_AUTHORIZATION, "Basic d3Jvbmc6d3Jvbmc=")
             .body(Empty::<Bytes>::new()).unwrap();
         let resp = sender.send_request(req).await.expect("send stats wrong auth");
         assert_eq!(resp.status(), http::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
         assert!(resp.headers().get(PROXY_AUTHENTICATE).is_some());
 
         // Correct auth -> 200 with JSON containing snapshot
-        let req = Request::builder().method("GET").uri("/stats").header(hyper::header::PROXY_AUTHORIZATION, auth_header)
+        let req = Request::builder().method("GET").uri("/stats").header(PROXY_AUTHORIZATION, auth_header)
             .body(Empty::<Bytes>::new()).unwrap();
         let mut resp = sender.send_request(req).await.expect("send stats ok");
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -1318,7 +1318,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("http://example.com/")
-            .header(hyper::header::PROXY_AUTHORIZATION, auth_header.clone())
+            .header(PROXY_AUTHORIZATION, auth_header.clone())
             .header(hyper::header::HOST, "example.com")
             .header("Proxy-Connection", "keep-alive")
             .body(Empty::<Bytes>::new())
