@@ -799,7 +799,6 @@ fn check_domain_access(
 }
 
 async fn tunnel(
-
     upgraded: Upgraded,
     addr: String,
     socks_connector: Arc<SocksConnector>,
@@ -1049,7 +1048,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
-
     use serial_test::serial;
 
     #[test]
