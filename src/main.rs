@@ -39,7 +39,7 @@ use tokio::signal;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::Builder;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE};
+use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, CONNECTION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
@@ -474,7 +474,7 @@ async fn proxy(
         match http_basic.as_ref() {
             Some(expected_auth) => {
                 if auth_header != expected_auth {
-                    warn!("Failed to authenticate: {:?}", headers);
+                    warn!("Proxy authentication failed (invalid or mismatched credentials)");
                     return Ok(proxy_auth_required_response(
                         "Proxy authentication required",
                     ));
@@ -633,7 +633,7 @@ async fn proxy(
         let mut req = req;
         if config.force_close {
             req.headers_mut()
-                .insert("connection", HeaderValue::from_static("close"));
+                .insert(CONNECTION, HeaderValue::from_static("close"));
         }
 
         let io = TokioIo::new(socks_stream);
