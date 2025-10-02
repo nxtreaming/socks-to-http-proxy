@@ -133,7 +133,22 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
+        let this = self.project();
+        match this.inner.poll_frame(cx) {
+            Poll::Ready(None) => {
+                // Response body has finished streaming. Allow the upstream
+                // connection driver to complete gracefully before releasing
+                // the connection guard to avoid abrupt aborts.
+                if let (Some(guard), Some(handle)) = (this.connection_guard.take(), this.driver_handle.take()) {
+                    tokio::spawn(async move {
+                        let _ = handle.await; // ignore join errors; connection likely closed
+                        drop(guard);
+                    });
+                }
+                Poll::Ready(None)
+            }
+            other => other,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
