@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io;
+use tokio::fs as tfs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,15 +82,16 @@ pub async fn all_snapshots() -> Vec<(u16, u64, u64)> {
 
 /// Load counters from a simple text file: lines of "port\trx\ttx"
 pub async fn load_from_file(path: &Path) -> io::Result<()> {
-    if !path.exists() {
+    if !tfs::try_exists(path).await? {
         return Ok(());
     }
-    let file = File::open(path)?;
+    let file = tfs::File::open(path).await?;
     let reader = BufReader::new(file);
 
     let mut updates = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        let line = line;
         if line.trim().is_empty() {
             continue;
         }
@@ -121,15 +123,15 @@ pub async fn load_from_file(path: &Path) -> io::Result<()> {
 pub async fn save_port_to_file(port: u16, path: &Path) -> io::Result<()> {
     let (rx, tx) = snapshot(port).await.unwrap_or((0, 0));
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        tfs::create_dir_all(dir).await?;
     }
     let mut tmp = PathBuf::from(path);
     tmp.set_extension("tmp");
-    let mut f = File::create(&tmp)?;
-    writeln!(f, "{}\t{}\t{}", port, rx, tx)?;
-    f.flush()?;
+    let mut f = tfs::File::create(&tmp).await?;
+    f.write_all(format!("{}\t{}\t{}\n", port, rx, tx).as_bytes()).await?;
+    f.flush().await?;
     drop(f);
-    fs::rename(tmp, path)?;
+    tfs::rename(tmp, path).await?;
     Ok(())
 }
 
@@ -138,16 +140,16 @@ pub async fn save_port_to_file(port: u16, path: &Path) -> io::Result<()> {
 pub async fn save_to_file(path: &Path) -> io::Result<()> {
     let snapshot: Vec<(u16, u64, u64)> = all_snapshots().await;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        tfs::create_dir_all(dir).await?;
     }
     let mut tmp = PathBuf::from(path);
     tmp.set_extension("tmp");
-    let mut f = File::create(&tmp)?;
+    let mut f = tfs::File::create(&tmp).await?;
     for (p, rx, tx) in snapshot {
-        writeln!(f, "{}\t{}\t{}", p, rx, tx)?;
+        f.write_all(format!("{}\t{}\t{}\n", p, rx, tx).as_bytes()).await?;
     }
-    f.flush()?;
+    f.flush().await?;
     drop(f);
-    fs::rename(tmp, path)?;
+    tfs::rename(tmp, path).await?;
     Ok(())
 }
