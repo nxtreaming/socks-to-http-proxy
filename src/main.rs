@@ -1400,3 +1400,169 @@ mod tests {
     }
 
 }
+
+    #[tokio::test]
+    async fn domain_whitelist_blocks_connect() {
+        use hyper::client::conn::http1 as client_http1;
+        use hyper::Request;
+        use hyper_util::rt::TokioIo;
+        use std::collections::HashSet;
+
+        let port = 18085u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        let mut allowed_set = HashSet::new();
+        allowed_set.insert("example.com".to_string()); // apex only
+
+        let config = Arc::new(ProxyConfig {
+            listen_addr: std::net::SocketAddr::from(([127,0,0,1], port)),
+            socks_addr: std::net::SocketAddr::from(([127,0,0,1], 1080)),
+            allowed_domains: Some(allowed_set),
+            http_basic_auth: None,
+            no_httpauth: true,
+            idle_timeout: 60,
+            conn_per_ip: 100,
+            force_close: true,
+            soax_settings: crate::config::SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
+            vendor_password: None,
+            socks_auth: None,
+            stats_dir: None,
+            stats_interval: 60,
+            connpnt_settings: crate::config::ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+        });
+
+        let socks = Arc::new(
+            crate::socks::SocksConnectorBuilder::new()
+                .socks_addr(config.socks_addr)
+                .build()
+                .expect("builder should succeed"),
+        );
+        let http_basic = Arc::new(config.http_basic_auth.clone());
+        let allowed = Arc::new(config.allowed_domains.clone());
+        let counters_arc = counters.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                proxy(
+                    req,
+                    Arc::clone(&socks),
+                    Arc::clone(&http_basic),
+                    Arc::clone(&allowed),
+                    Arc::clone(&config),
+                    None,
+                    Arc::clone(&counters_arc),
+                )
+            });
+            if let Err(e) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                panic!("server error: {}", e);
+            }
+        });
+
+        let (mut sender, conn) = client_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake");
+        let client_task = tokio::spawn(async move { let _ = conn.await; });
+
+        let req = Request::builder().method("CONNECT").uri("other.com:443")
+            .body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.expect("send CONNECT");
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn domain_whitelist_allows_connect_then_fails_upstream() {
+        use hyper::client::conn::http1 as client_http1;
+        use hyper::Request;
+        use hyper_util::rt::TokioIo;
+        use std::collections::HashSet;
+
+        let port = 18086u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        let mut allowed_set = HashSet::new();
+        allowed_set.insert(".example.com".to_string()); // apex + subdomains
+
+        let config = Arc::new(ProxyConfig {
+            listen_addr: std::net::SocketAddr::from(([127,0,0,1], port)),
+            socks_addr: std::net::SocketAddr::from(([127,0,0,1], 1080)),
+            allowed_domains: Some(allowed_set),
+            http_basic_auth: None,
+            no_httpauth: true,
+            idle_timeout: 60,
+            conn_per_ip: 100,
+            force_close: true,
+            soax_settings: crate::config::SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
+            vendor_password: None,
+            socks_auth: None,
+            stats_dir: None,
+            stats_interval: 60,
+            connpnt_settings: crate::config::ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+        });
+
+        let socks = Arc::new(
+            crate::socks::SocksConnectorBuilder::new()
+                .socks_addr(config.socks_addr)
+                .build()
+                .expect("builder should succeed"),
+        );
+        let http_basic = Arc::new(config.http_basic_auth.clone());
+        let allowed = Arc::new(config.allowed_domains.clone());
+        let counters_arc = counters.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                proxy(
+                    req,
+                    Arc::clone(&socks),
+                    Arc::clone(&http_basic),
+                    Arc::clone(&allowed),
+                    Arc::clone(&config),
+                    None,
+                    Arc::clone(&counters_arc),
+                )
+            });
+            if let Err(e) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                panic!("server error: {}", e);
+            }
+        });
+
+        let (mut sender, conn) = client_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake");
+        let client_task = tokio::spawn(async move { let _ = conn.await; });
+
+        let req = Request::builder().method("CONNECT").uri("example.com:443")
+            .body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.expect("send CONNECT allowed");
+        // Not a 403; likely 502 because SOCKS upstream missing
+        assert_ne!(resp.status(), http::StatusCode::FORBIDDEN);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
