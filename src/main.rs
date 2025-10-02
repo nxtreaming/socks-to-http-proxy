@@ -42,7 +42,7 @@ use tokio::signal;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::Builder;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, CONNECTION};
+use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, CONNECTION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
@@ -590,6 +590,13 @@ async fn proxy(
                 .insert(CONNECTION, HeaderValue::from_static("close"));
         }
 
+        {
+            // Remove proxy-specific headers so upstream servers never see proxy credentials.
+            let headers = req.headers_mut();
+            headers.remove(PROXY_AUTHORIZATION);
+            headers.remove("proxy-connection");
+        }
+
         let io = TokioIo::new(socks_stream);
 
         let (mut sender, conn) = Builder::new()
@@ -1038,6 +1045,10 @@ mod tests {
     use http_body_util::Empty;
     use hyper::header::HeaderValue;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    use tokio::time::{timeout, Duration};
 
     use serial_test::serial;
 
@@ -1218,6 +1229,118 @@ mod tests {
         drop(sender);
         let _ = client_task.await;
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_request_strips_proxy_headers() {
+        use hyper::Request;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let port = 18087u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake socks listener");
+        let socks_addr = socks_listener.local_addr().expect("listener addr");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        let socks_task = tokio::spawn(async move {
+            let (mut stream, _) = socks_listener.accept().await.expect("accept socks client");
+
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.expect("read greeting header");
+            let methods_len = greeting[1] as usize;
+            let mut methods = vec![0u8; methods_len];
+            if methods_len > 0 {
+                stream.read_exact(&mut methods).await.expect("read auth methods");
+            }
+            stream.write_all(&[0x05, 0x00]).await.expect("write method selection");
+
+            let mut request_header = [0u8; 4];
+            stream.read_exact(&mut request_header).await.expect("read request header");
+            let atyp = request_header[3];
+            match atyp {
+                0x01 => {
+                    let mut addr = [0u8; 4];
+                    stream.read_exact(&mut addr).await.expect("read ipv4 address");
+                }
+                0x03 => {
+                    let mut len_buf = [0u8; 1];
+                    stream.read_exact(&mut len_buf).await.expect("read domain length");
+                    let len = len_buf[0] as usize;
+                    let mut domain = vec![0u8; len];
+                    if len > 0 {
+                        stream.read_exact(&mut domain).await.expect("read domain name");
+                    }
+                }
+                0x04 => {
+                    let mut addr = [0u8; 16];
+                    stream.read_exact(&mut addr).await.expect("read ipv6 address");
+                }
+                _ => {}
+            }
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await.expect("read port");
+
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.expect("write connect reply");
+
+            let mut buffer = Vec::new();
+            let mut temp = [0u8; 1024];
+            loop {
+                match timeout(Duration::from_secs(1), stream.read(&mut temp)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        buffer.extend_from_slice(&temp[..n]);
+                        if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => panic!("failed to read http request: {e}"),
+                    Err(_) => break,
+                }
+            }
+
+            let mut captured = captured_clone.lock().await;
+            *captured = buffer;
+
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.expect("write http response");
+            stream.shutdown().await.expect("shutdown socks stream");
+        });
+
+        let auth_header = basic_auth_header("user", "pass");
+        let mut cfg = base_proxy_config(port);
+        cfg.http_basic_auth = Some(auth_header.clone());
+        cfg.no_httpauth = false;
+        cfg.socks_addr = socks_addr;
+        let config = Arc::new(cfg);
+
+        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .header(hyper::header::PROXY_AUTHORIZATION, auth_header.clone())
+            .header(hyper::header::HOST, "example.com")
+            .header("Proxy-Connection", "keep-alive")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let resp = sender.send_request(req).await.expect("send authenticated request");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+        let _ = socks_task.await;
+
+        let captured_bytes = captured.lock().await.clone();
+        assert!(!captured_bytes.is_empty(), "expected captured HTTP request");
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+        let lower = captured_str.to_lowercase();
+        assert!(!lower.contains("proxy-authorization"));
+        assert!(!lower.contains("proxy-connection"));
+        assert!(lower.contains("host: example.com"));
     }
 
     #[tokio::test]
