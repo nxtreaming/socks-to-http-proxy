@@ -201,6 +201,7 @@ impl SocksConnector {
 
 /// Builder for creating SOCKS5 connectors
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct SocksConnectorBuilder {
     socks_addr: Option<SocketAddr>,
     auth: Option<Auth>,
@@ -292,12 +293,6 @@ impl SocksConnectorBuilder {
         connector.validate()?;
 
         Ok(connector)
-    }
-}
-
-impl Default for SocksConnectorBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
