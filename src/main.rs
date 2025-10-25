@@ -106,6 +106,8 @@ where
 // Body wrapper that owns both the connection guard and the driver handle
 // ensuring the handle is completed or aborted before the guard is released.
 #[pin_project(PinnedDrop)]
+/// Wraps an HTTP response body together with the bookkeeping required to keep
+/// the connection count in sync with the lifecycle of the underlying IO task.
 struct GuardedBody<B> {
     #[pin]
     inner: B,
@@ -171,6 +173,9 @@ impl<B> PinnedDrop for GuardedBody<B> {
             }
         }
 
+        // Ensure the connection guard is always released, even if the body is
+        // dropped before reaching the end of stream (for example due to a
+        // client disconnect or task cancellation).
         drop(this.connection_guard.take());
     }
 }
