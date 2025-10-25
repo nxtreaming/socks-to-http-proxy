@@ -8,7 +8,7 @@ mod socks;
 mod traffic;
 
 use crate::buffer_pool::lease_buffer;
-use crate::config::{Cli, ProxyConfig};
+use crate::config::{Cli, ProxyConfig, ListenMode};
 use crate::connection::{
     get_ip_tracker, is_backlog_threshold_exceeded, is_memory_pressure_high, ConnectionGuard,
     ACTIVE_SOCKS5_CONNECTIONS, CONNECTION_BACKLOG_THRESHOLD, MAX_CONCURRENT_CONNECTIONS,
@@ -191,8 +191,16 @@ async fn main() -> Result<()> {
     // Create proxy configuration from CLI arguments
     let config = Arc::new(ProxyConfig::from_cli(args).await?);
 
-    info!("HTTP Proxy listening on http://{}", config.listen_addr);
-    info!("SOCKS5 backend: {}", config.socks_addr);
+    if config.socks_listen_addr.is_some() {
+        info!("HTTP Proxy listening on http://{}", config.listen_addr);
+        info!("SOCKS5 Proxy listening on socks5://{}", config.socks_listen_addr.unwrap());
+    } else {
+        match config.mode {
+            ListenMode::Http => info!("HTTP Proxy listening on http://{}", config.listen_addr),
+            ListenMode::Socks => info!("SOCKS5 Proxy listening on socks5://{}", config.listen_addr),
+        }
+    }
+    info!("Upstream SOCKS5: {}", config.socks_addr);
 
     if config.soax_settings.enabled {
         info!(
@@ -205,17 +213,13 @@ async fn main() -> Result<()> {
     let http_basic = Arc::new(config.http_basic_auth.clone());
     let allowed_domains = Arc::new(config.allowed_domains.clone());
 
-    // Traffic counters for this listening port
+    // Traffic counters and periodic stats for HTTP listener (if running on this process)
     let listen_port = config.listen_addr.port();
     let traffic_counters = get_counters_for_port(listen_port).await;
-    // Compute stats file path from config
-    let stats_path = get_stats_path(&config);
-    // Load persisted traffic counters for this port (if any)
+    let stats_path = get_stats_path(&config, listen_port);
     if let Err(e) = load_from_file(&stats_path).await {
         warn!("Failed to load traffic stats from {:?}: {}", stats_path, e);
     }
-
-    // Periodically log and persist traffic stats
     {
         let counters = Arc::clone(&traffic_counters);
         let stats_path = stats_path.clone();
@@ -232,6 +236,35 @@ async fn main() -> Result<()> {
         });
     }
 
+    // If an additional SOCKS listener is configured, initialize its counters and stats tasks
+    let (socks_extra_listener, traffic_counters_socks, _stats_path_socks) = if let Some(saddr) = &config.socks_listen_addr {
+        let sport = saddr.port();
+        let counters = get_counters_for_port(sport).await;
+        let path = get_stats_path(&config, sport);
+        if let Err(e) = load_from_file(&path).await {
+            warn!("Failed to load traffic stats from {:?}: {}", path, e);
+        }
+        {
+            let counters = Arc::clone(&counters);
+            let path = path.clone();
+
+            let interval = config.stats_interval.max(1);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    let (rx, tx) = counters.get();
+                    info!("Traffic[port={}]: rx={}B, tx={}B", sport, rx, tx);
+                    if let Err(e) = save_port_to_file(sport, &path).await {
+                        warn!("Failed to save traffic stats: {}", e);
+                    }
+                }
+            });
+        }
+        (Some(*saddr), Some(counters), Some(path))
+    } else {
+        (None, None, None)
+    };
+
     // Create SOCKS5 connector
     let socks_connector = Arc::new(SocksConnector::new(
         config.socks_addr,
@@ -242,6 +275,15 @@ async fn main() -> Result<()> {
     ));
 
     let listener = TcpListener::bind(config.listen_addr).await?;
+    // Optional extra SOCKS listener bound if configured
+    let mut extra_socks_listener: Option<TcpListener> = None;
+    if let Some(addr) = socks_extra_listener {
+        match TcpListener::bind(addr).await {
+            Ok(l) => extra_socks_listener = Some(l),
+            Err(e) => warn!("Failed to bind extra SOCKS listener on {}: {}", addr, e),
+        }
+    }
+
 
     // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
@@ -334,6 +376,12 @@ async fn main() -> Result<()> {
             }
         }
     };
+    // Clone Arcs specifically for the main server loop so originals remain for the extra listener
+    let sc_for_server = Arc::clone(&socks_connector);
+    let hb_for_server = Arc::clone(&http_basic);
+    let ad_for_server = Arc::clone(&allowed_domains);
+    let cfg_for_server = Arc::clone(&config);
+
 
     // Main server loop
     let server = async move {
@@ -343,7 +391,7 @@ async fn main() -> Result<()> {
                     // Check per-IP connection limits atomically
                     let ip_tracker = get_ip_tracker();
                     let client_ip = peer_addr.ip();
-                    let conn_limit = config.conn_per_ip;
+                    let conn_limit = cfg_for_server.conn_per_ip;
 
                     // Atomically check and increment connection count
                     let new_count = match ip_tracker.try_increment(client_ip, conn_limit).await {
@@ -368,10 +416,10 @@ async fn main() -> Result<()> {
                     }
 
                     // Clone Arc references for the spawned task
-                    let socks_connector = Arc::clone(&socks_connector);
-                    let http_basic = Arc::clone(&http_basic);
-                    let allowed_domains = Arc::clone(&allowed_domains);
-                    let config = Arc::clone(&config);
+                    let socks_connector = Arc::clone(&sc_for_server);
+                    let http_basic = Arc::clone(&hb_for_server);
+                    let allowed_domains = Arc::clone(&ad_for_server);
+                    let config = Arc::clone(&cfg_for_server);
                     let traffic_counters2 = Arc::clone(&traffic_counters);
                     let sessionid = if config.soax_settings.enabled {
                         Some(new_session_id())
@@ -379,31 +427,47 @@ async fn main() -> Result<()> {
                         None
                     };
                     tokio::task::spawn(async move {
-                        let io = TokioIo::new(stream);
-                        let sess = sessionid.clone();
-                        let counters = Arc::clone(&traffic_counters2);
-                        let service = service_fn(move |req| {
-                            proxy(
-                                req,
+                        let http_on_main = config.socks_listen_addr.is_some() || config.mode == ListenMode::Http;
+                        if http_on_main {
+                            let io = TokioIo::new(stream);
+                            let sess = sessionid.clone();
+                            let counters = Arc::clone(&traffic_counters2);
+                            let service = service_fn(move |req| {
+                                proxy(
+                                    req,
+                                    Arc::clone(&socks_connector),
+                                    Arc::clone(&http_basic),
+                                    Arc::clone(&allowed_domains),
+                                    Arc::clone(&config),
+                                    sess.clone(),
+                                    Arc::clone(&counters),
+                                )
+                            });
+
+                            if let Err(err) = http1::Builder::new()
+                                .preserve_header_case(true)
+                                .title_case_headers(true)
+
+                                .serve_connection(io, service)
+                                .with_upgrades()
+                                .await
+                            {
+                                // Only log connection errors, not normal endings
+                                if !err.to_string().contains("connection closed") {
+                                    warn!("Connection from {} error: {:?}", peer_addr, err);
+                                }
+                            }
+                        } else {
+                            if let Err(err) = handle_socks5_client(
+                                stream,
+                                peer_addr,
                                 Arc::clone(&socks_connector),
-                                Arc::clone(&http_basic),
                                 Arc::clone(&allowed_domains),
                                 Arc::clone(&config),
-                                sess.clone(),
-                                Arc::clone(&counters),
-                            )
-                        });
-
-                        if let Err(err) = http1::Builder::new()
-                            .preserve_header_case(true)
-                            .title_case_headers(true)
-                            .serve_connection(io, service)
-                            .with_upgrades()
-                            .await
-                        {
-                            // Only log connection errors, not normal endings
-                            if !err.to_string().contains("connection closed") {
-                                warn!("Connection from {} error: {:?}", peer_addr, err);
+                                sessionid.clone(),
+                                Arc::clone(&traffic_counters2),
+                            ).await {
+                                warn!("SOCKS5 client {} error: {:?}", peer_addr, err);
                             }
                         }
 
@@ -418,6 +482,66 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // Spawn accept loop for extra SOCKS listener if present
+    if let Some(listener2) = extra_socks_listener {
+        let socks_connector = Arc::clone(&socks_connector);
+        let allowed_domains = Arc::clone(&allowed_domains);
+        let config = Arc::clone(&config);
+        let traffic_counters2 = Arc::clone(traffic_counters_socks.as_ref().expect("socks counters must be initialized"));
+        tokio::spawn(async move {
+            loop {
+                match listener2.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        let ip_tracker = get_ip_tracker();
+                        let client_ip = peer_addr.ip();
+                        let conn_limit = config.conn_per_ip;
+                        let new_count = match ip_tracker.try_increment(client_ip, conn_limit).await {
+                            Some(count) => count,
+                            None => {
+                                let current_count = ip_tracker.get_count(client_ip).await;
+                                warn!(
+                                    "Connection limit exceeded for IP {}: {} connections (limit: {})",
+                                    client_ip, current_count, conn_limit
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
+                        if new_count > 20 {
+                            info!(
+                                "High connection count for IP {}: {} connections",
+                                client_ip, new_count
+                            );
+                        }
+                        let socks_connector = Arc::clone(&socks_connector);
+                        let allowed_domains = Arc::clone(&allowed_domains);
+                        let config = Arc::clone(&config);
+                        let counters = Arc::clone(&traffic_counters2);
+                        let sessionid = if config.soax_settings.enabled { Some(new_session_id()) } else { None };
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_socks5_client(
+                                stream,
+                                peer_addr,
+                                socks_connector,
+                                allowed_domains,
+                                config,
+                                sessionid,
+                                counters,
+                            ).await {
+                                warn!("SOCKS5 client {} error: {:?}", peer_addr, err);
+                            }
+                            ip_tracker.decrement(client_ip).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Accept error (extra socks): {} (continuing)", e);
+                        continue;
+                    }
+                }
+            }
+        });
+    }
 
     // Run server until the shutdown signal is received
     tokio::select! {
@@ -450,7 +574,7 @@ async fn proxy(
     if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
         let port = config.listen_addr.port();
         reset_port(port).await;
-        let stats_path = get_stats_path(&config);
+        let stats_path = get_stats_path(&config, port);
         if let Err(e) = save_port_to_file(port, &stats_path).await {
             warn!("Failed to persist stats after reset: {}", e);
         }
@@ -732,9 +856,8 @@ fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hy
     response
 }
 
-/// Helper function to compute stats file path
-fn get_stats_path(config: &ProxyConfig) -> PathBuf {
-    let port = config.listen_addr.port();
+/// Helper function to compute stats file path for a specific port
+fn get_stats_path(config: &ProxyConfig, port: u16) -> PathBuf {
     match &config.stats_dir {
         Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", port)),
         None => PathBuf::from(format!("traffic_stats_{}.txt", port)),
@@ -946,13 +1069,245 @@ async fn tunnel(
     Ok(())
 }
 
+async fn handle_socks5_client(
+    mut client: tokio::net::TcpStream,
+    peer_addr: std::net::SocketAddr,
+    socks_connector: Arc<SocksConnector>,
+    allowed_domains: Arc<Option<HashSet<String>>>,
+    config: Arc<ProxyConfig>,
+    sessionid: Option<String>,
+    traffic_counters: Arc<TrafficCounters>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Connection guard to cap concurrent tunnels
+    let _connection_guard = match ConnectionGuard::try_new() {
+        Some(guard) => guard,
+        None => {
+            let current_connections = ConnectionGuard::active_count();
+            warn!(
+                "SOCKS5 connection limit reached: {} (max: {})",
+                current_connections, MAX_CONCURRENT_CONNECTIONS
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Server overloaded",
+            )
+            .into());
+        }
+    };
+
+    // 1) Handshake: read methods
+    let mut header = [0u8; 2];
+    client.read_exact(&mut header).await?;
+    if header[0] != 0x05 {
+        return Err(color_eyre::eyre::eyre!("Unsupported SOCKS version {}", header[0]));
+    }
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    if nmethods > 0 {
+        client.read_exact(&mut methods).await?;
+    }
+    let need_auth = config.socks_in_auth.is_some();
+    let chosen = if need_auth { 0x02 } else { 0x00 };
+    if !methods.iter().any(|&m| m == chosen) {
+        // No acceptable methods
+        let _ = client.write_all(&[0x05, 0xFF]).await;
+        return Err(color_eyre::eyre::eyre!(
+            "Client did not offer required auth method (need {}): {:?}",
+            if need_auth { "username/password" } else { "noauth" },
+            methods
+        ));
+    }
+    client.write_all(&[0x05, chosen]).await?;
+
+    // 2) Optional username/password auth (RFC 1929)
+    if chosen == 0x02 {
+        let mut ver = [0u8; 1];
+        client.read_exact(&mut ver).await?;
+        if ver[0] != 0x01 {
+            let _ = client.write_all(&[0x01, 0x01]).await; // failure
+            return Err(color_eyre::eyre::eyre!("Invalid auth version {}", ver[0]));
+        }
+        // username
+        let mut ulen = [0u8; 1];
+        client.read_exact(&mut ulen).await?;
+        let ulen = ulen[0] as usize;
+        let mut ubuf = vec![0u8; ulen];
+        if ulen > 0 {
+            client.read_exact(&mut ubuf).await?;
+        }
+        // password
+        let mut plen = [0u8; 1];
+        client.read_exact(&mut plen).await?;
+        let plen = plen[0] as usize;
+        let mut pbuf = vec![0u8; plen];
+        if plen > 0 {
+            client.read_exact(&mut pbuf).await?;
+        }
+        let user = String::from_utf8_lossy(&ubuf).to_string();
+        let pass = String::from_utf8_lossy(&pbuf).to_string();
+        match &config.socks_in_auth {
+            Some(expected) if expected.username == user && expected.password == pass => {
+                client.write_all(&[0x01, 0x00]).await?; // success
+            }
+            _ => {
+                let _ = client.write_all(&[0x01, 0x01]).await; // failure
+                return Err(color_eyre::eyre::eyre!("SOCKS5 inbound auth failed for {peer_addr}"));
+            }
+        }
+    }
+
+    // 3) Request: CONNECT only
+    let mut req_hdr = [0u8; 4];
+    client.read_exact(&mut req_hdr).await?;
+    if req_hdr[0] != 0x05 {
+        return Err(color_eyre::eyre::eyre!("Invalid request version {}", req_hdr[0]));
+    }
+    if req_hdr[1] != 0x01 {
+        // Command not supported
+        let _ = client
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Err(color_eyre::eyre::eyre!("Unsupported SOCKS5 cmd {}", req_hdr[1]));
+    }
+    let atyp = req_hdr[3];
+
+    // destination address
+    let mut domain_opt: Option<String> = None;
+    let dest_host_port = match atyp {
+        0x01 => {
+            // IPv4
+            let mut ip = [0u8; 4];
+            client.read_exact(&mut ip).await?;
+            let mut portb = [0u8; 2];
+            client.read_exact(&mut portb).await?;
+            let port = u16::from_be_bytes(portb);
+            let host = std::net::Ipv4Addr::from(ip);
+            format!("{}:{}", host, port)
+        }
+        0x03 => {
+            // Domain
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len).await?;
+            let len = len[0] as usize;
+            let mut dom = vec![0u8; len];
+            if len > 0 { client.read_exact(&mut dom).await?; }
+            let mut portb = [0u8; 2];
+            client.read_exact(&mut portb).await?;
+            let port = u16::from_be_bytes(portb);
+            let domain = String::from_utf8_lossy(&dom).to_string();
+            domain_opt = Some(domain.clone());
+            format!("{}:{}", domain, port)
+        }
+        0x04 => {
+            // IPv6
+            let mut ip = [0u8; 16];
+            client.read_exact(&mut ip).await?;
+            let mut portb = [0u8; 2];
+            client.read_exact(&mut portb).await?;
+            let port = u16::from_be_bytes(portb);
+            let host = std::net::Ipv6Addr::from(ip);
+            format!("[{}]:{}", host, port)
+        }
+        _ => {
+            let _ = client
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(color_eyre::eyre::eyre!("Address type not supported: {}", atyp));
+        }
+    };
+
+    // Domain allowlist check (if applicable)
+    if let (Some(allowed), Some(domain)) = (allowed_domains.as_ref(), domain_opt.as_ref()) {
+        if !is_domain_allowed(allowed, domain) {
+            let _ = client
+                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            warn!("Access to domain {} is not allowed (SOCKS mode)", domain);
+            return Ok(());
+        }
+    }
+
+    // 4) Connect upstream via SOCKS5
+    let mut server = match socks_connector.connect(dest_host_port.as_str(), sessionid.as_deref()).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = client
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) // general failure
+                .await;
+            return Err(color_eyre::eyre::eyre!("Upstream SOCKS connect failed: {}", e));
+        }
+    };
+
+    // 5) Reply success to client
+    client
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+
+    // 6) Bidirectional copy with idle timeout and traffic counters
+    let timeout = tokio::time::Duration::from_secs(config.idle_timeout);
+    let mut from_client = 0u64;
+    let mut from_server = 0u64;
+
+    let use_large_buffers = config.idle_timeout > 300;
+    let mut client_lease = lease_buffer(use_large_buffers).await;
+    let mut server_lease = lease_buffer(use_large_buffers).await;
+    let idle = tokio::time::sleep(timeout);
+    tokio::pin!(idle);
+
+    loop {
+        tokio::select! {
+            res = client.read(client_lease.as_mut_slice()) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = server.write_all(&client_lease.as_mut_slice()[..n]).await {
+                            warn!("SOCKS tunnel server write error: {}", e); break;
+                        }
+                        from_client += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => { warn!("SOCKS tunnel client read error: {}", e); break; }
+                }
+            }
+            res = server.read(server_lease.as_mut_slice()) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = client.write_all(&server_lease.as_mut_slice()[..n]).await {
+                            warn!("SOCKS tunnel client write error: {}", e); break;
+                        }
+                        from_server += n as u64;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    Err(e) => { warn!("SOCKS tunnel server read error: {}", e); break; }
+                }
+            }
+            _ = &mut idle => {
+                warn!("SOCKS tunnel idle timeout after {:?}, closing", timeout);
+                break;
+            }
+        }
+    }
+
+    traffic_counters.add_rx(from_client);
+    traffic_counters.add_tx(from_server);
+
+    let _ = server.shutdown().await;
+    let _ = client.shutdown().await;
+    Ok(())
+}
+
 #[cfg(test)]
 fn base_proxy_config(port: u16) -> ProxyConfig {
     use crate::config::{SoaxSettings, ConnpntSettings};
 
     ProxyConfig {
+        mode: ListenMode::Http,
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         socks_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1080)),
+        socks_listen_addr: None,
         allowed_domains: None,
         http_basic_auth: None,
         no_httpauth: true,
@@ -962,6 +1317,7 @@ fn base_proxy_config(port: u16) -> ProxyConfig {
         soax_settings: SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
         vendor_password: None,
         socks_auth: None,
+        socks_in_auth: None,
         stats_dir: None,
         stats_interval: 60,
         connpnt_settings: ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
@@ -1234,6 +1590,60 @@ mod tests {
         let _ = server.await;
     }
 
+
+        #[tokio::test]
+        async fn stats_endpoints_dual_listener_http_port() {
+            use hyper::Request;
+            use http_body_util::BodyExt;
+
+            let http_port = 18089u16;
+            let socks_port = 18090u16;
+            reset_port(http_port).await;
+            reset_port(socks_port).await;
+
+            let http_counters = get_counters_for_port(http_port).await;
+            http_counters.set(111, 222);
+            let socks_counters = get_counters_for_port(socks_port).await;
+            socks_counters.set(333, 444);
+
+            let mut cfg = base_proxy_config(http_port);
+            cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], socks_port)));
+            cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_dual").to_string_lossy().to_string());
+            let config = Arc::new(cfg);
+
+            let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), http_counters.clone()).await;
+
+            // GET /stats should return HTTP port counters
+            let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
+            let mut resp = sender.send_request(req).await.expect("send stats");
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body_bytes);
+            assert!(body.contains(&format!("\"port\":{}", http_port)));
+            assert!(body.contains("\"rx\":111"));
+            assert!(body.contains("\"tx\":222"));
+
+            drop(sender);
+            let _ = client_task.await;
+            let _ = server.await;
+        }
+
+        #[test]
+        fn get_stats_path_distinct_files() {
+            let port_a = 19001u16;
+            let port_b = 19002u16;
+            let mut cfg = base_proxy_config(port_a);
+            cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_paths").to_string_lossy().to_string());
+            // Even if we set socks_listen_addr, file names must depend on the queried port
+            cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], port_b)));
+
+            let pa = super::get_stats_path(&cfg, port_a);
+            let pb = super::get_stats_path(&cfg, port_b);
+            assert_ne!(pa, pb, "expected different stats files per port");
+            assert!(pa.to_string_lossy().contains(&port_a.to_string()));
+            assert!(pb.to_string_lossy().contains(&port_b.to_string()));
+        }
+
     #[tokio::test]
     async fn authenticated_request_strips_proxy_headers() {
         use hyper::Request;
@@ -1465,4 +1875,219 @@ mod tests {
         let _ = client_task.await;
         let _ = server.await;
     }
+
+    #[tokio::test]
+    async fn dual_listeners_end_to_end() {
+        use tokio::time::{timeout, Duration};
+        use hyper::client::conn::http1::Builder as ClientBuilder;
+        use hyper_util::rt::TokioIo;
+        use hyper::Request;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1) Fake upstream SOCKS5 server that replies 200 OK for any CONNECT tunnel
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream socks");
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match upstream.accept().await { Ok(v) => v, Err(_) => break };
+                // greeting
+                let mut g = [0u8;2]; if stream.read_exact(&mut g).await.is_err() { break; }
+                let mut methods = vec![0u8; g[1] as usize]; if g[1] > 0 { if stream.read_exact(&mut methods).await.is_err() { break; } }
+                let _ = stream.write_all(&[0x05, 0x00]).await; // no-auth
+                // request header
+                let mut h = [0u8;4]; if stream.read_exact(&mut h).await.is_err() { break; }
+                match h[3] { // ATYP consume address
+                    0x01 => { let mut b=[0u8;4]; let _=stream.read_exact(&mut b).await; }
+                    0x03 => { let mut l=[0u8;1]; let _=stream.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=stream.read_exact(&mut d).await; } }
+                    0x04 => { let mut b=[0u8;16]; let _=stream.read_exact(&mut b).await; }
+                    _ => {}
+                }
+                let mut port=[0u8;2]; let _=stream.read_exact(&mut port).await;
+                let _ = stream.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await; // success
+                // Read until end of HTTP headers then respond 200
+                let mut buf = Vec::new(); let mut tmp=[0u8;1024];
+                loop {
+                    match timeout(Duration::from_millis(500), stream.read(&mut tmp)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => { buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } },
+                        _ => break,
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+
+        // 2) Start our proxy with dual listeners on ephemeral ports
+        let mut cfg = base_proxy_config(0);
+        cfg.socks_addr = upstream_addr;
+        cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], 0)));
+        cfg.no_httpauth = true;
+        cfg.force_close = true;
+
+        // Spawn minimal dual listeners (test-only)
+        async fn spawn_dual(config: ProxyConfig) -> (std::net::SocketAddr, std::net::SocketAddr, JoinHandle<()>, JoinHandle<()>) {
+            use hyper::server::conn::http1;
+            use hyper::service::service_fn;
+            let http_listener = TcpListener::bind(config.listen_addr).await.expect("bind http");
+            let http_addr = http_listener.local_addr().unwrap();
+            let socks_listener = TcpListener::bind(config.socks_listen_addr.unwrap()).await.expect("bind socks");
+            let socks_addr = socks_listener.local_addr().unwrap();
+            let mut resolved = config.clone();
+            resolved.listen_addr = http_addr; resolved.socks_listen_addr = Some(socks_addr);
+            let cfg = Arc::new(resolved);
+            let http_basic = Arc::new(cfg.http_basic_auth.clone());
+            let allowed = Arc::new(cfg.allowed_domains.clone());
+            let counters_http = get_counters_for_port(http_addr.port()).await;
+            let counters_socks = get_counters_for_port(socks_addr.port()).await;
+            let socks_connector = Arc::new(SocksConnector::new(
+                cfg.socks_addr,
+                Arc::new(cfg.socks_auth.clone()),
+                Arc::new(cfg.vendor_password.clone()),
+                Arc::new(cfg.soax_settings.clone()),
+                Arc::new(cfg.connpnt_settings.clone()),
+            ));
+            let cfg_h = Arc::clone(&cfg); let sc_h = Arc::clone(&socks_connector); let allowed_h = Arc::clone(&allowed); let http_basic_h = Arc::clone(&http_basic); let counters_h = Arc::clone(&counters_http);
+            let h_task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match http_listener.accept().await { Ok(v)=>v, Err(_)=>break };
+                    let sc = Arc::clone(&sc_h); let hb = Arc::clone(&http_basic_h); let ad = Arc::clone(&allowed_h); let cfg = Arc::clone(&cfg_h); let counters = Arc::clone(&counters_h);
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |req| proxy(req, Arc::clone(&sc), Arc::clone(&hb), Arc::clone(&ad), Arc::clone(&cfg), None, Arc::clone(&counters)));
+                        let _ = http1::Builder::new().preserve_header_case(true).title_case_headers(true).serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
+                    });
+                }
+            });
+            let sc_s = Arc::clone(&socks_connector); let allowed_s = Arc::clone(&allowed); let cfg_s = Arc::clone(&cfg); let counters_s = Arc::clone(&counters_socks);
+            let s_task = tokio::spawn(async move {
+                loop {
+                    let (stream, peer) = match socks_listener.accept().await { Ok(v)=>v, Err(_)=>break };
+                    let sc = Arc::clone(&sc_s); let ad = Arc::clone(&allowed_s); let cfg = Arc::clone(&cfg_s); let counters = Arc::clone(&counters_s);
+                    tokio::spawn(async move { let _ = handle_socks5_client(stream, peer, sc, ad, cfg, None, counters).await; });
+                }
+            });
+            (http_addr, socks_addr, h_task, s_task)
+        }
+        let (http_addr, socks_addr, http_task, socks_task) = spawn_dual(cfg).await;
+
+        // 3) Run HTTP and SOCKS clients concurrently
+        let http_fut = async {
+            // Connect hyper client to HTTP listener
+            let stream = tokio::net::TcpStream::connect(http_addr).await.expect("connect http");
+            let (mut sender, conn) = ClientBuilder::new().preserve_header_case(true).title_case_headers(true).handshake(TokioIo::new(stream)).await.expect("handshake");
+            let client_task = tokio::spawn(async move { let _ = conn.await; });
+            let req = Request::builder().method("GET").uri("http://example.com/").header(hyper::header::HOST, "example.com").body(Empty::<Bytes>::new()).unwrap();
+            let resp = sender.send_request(req).await.expect("send http");
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            drop(sender); let _ = client_task.await;
+        };
+        let socks_fut = async {
+            let mut c = tokio::net::TcpStream::connect(socks_addr).await.expect("connect socks");
+            let _ = c.write_all(&[0x05,0x01,0x00]).await; // noauth offer
+            let mut sel=[0u8;2]; let _=c.read_exact(&mut sel).await; assert_eq!(sel, [0x05,0x00]);
+            let host=b"example.com"; let mut req=Vec::with_capacity(4+1+host.len()+2);
+            req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
+            let _=c.write_all(&req).await; let mut rep=[0u8;10]; let _=c.read_exact(&mut rep).await; assert_eq!(rep[1], 0x00);
+            let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+            let mut buf=Vec::new(); let mut tmp=[0u8;1024];
+            loop { match timeout(Duration::from_millis(800), c.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
+            let txt=String::from_utf8_lossy(&buf); assert!(txt.contains("200 OK"), "resp: {}", txt);
+        };
+        let _ = tokio::join!(http_fut, socks_fut);
+
+        // Cleanup
+        http_task.abort(); socks_task.abort(); upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn socks_inbound_auth_end_to_end() {
+        use tokio::time::{timeout, Duration};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::auth::Auth;
+
+        // Fake upstream SOCKS5 server (no-auth) that responds 200 OK over tunnel
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match upstream.accept().await { Ok(v)=>v, Err(_)=>break };
+                // greeting
+                let mut g=[0u8;2]; if stream.read_exact(&mut g).await.is_err() { break; }
+                let mut methods = vec![0u8; g[1] as usize]; if g[1]>0 { if stream.read_exact(&mut methods).await.is_err() { break; } }
+                let _ = stream.write_all(&[0x05,0x00]).await; // select no-auth
+                // request header + consume dest
+                let mut h=[0u8;4]; if stream.read_exact(&mut h).await.is_err() { break; }
+                match h[3] {
+                    0x01 => { let mut b=[0u8;4]; let _=stream.read_exact(&mut b).await; }
+                    0x03 => { let mut l=[0u8;1]; let _=stream.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=stream.read_exact(&mut d).await; } }
+                    0x04 => { let mut b=[0u8;16]; let _=stream.read_exact(&mut b).await; }
+                    _ => {}
+                }
+                let mut port=[0u8;2]; let _=stream.read_exact(&mut port).await;
+                let _ = stream.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await; // success
+                // Read HTTP headers then reply 200
+                let mut buf=Vec::new(); let mut tmp=[0u8;1024];
+                loop { match timeout(Duration::from_millis(500), stream.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+
+        // Start proxy with inbound SOCKS auth required
+        let mut cfg = base_proxy_config(0);
+        cfg.socks_addr = upstream_addr;
+        cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], 0)));
+        cfg.socks_in_auth = Some(Auth::new("user".to_string(), "pass".to_string()));
+        cfg.no_httpauth = true;
+        cfg.force_close = true;
+
+        // Minimal dual listeners (reuse helper pattern from previous test)
+        async fn spawn_dual(config: ProxyConfig) -> (std::net::SocketAddr, JoinHandle<()>) {
+            let socks_listener = TcpListener::bind(config.socks_listen_addr.unwrap()).await.expect("bind socks");
+            let socks_addr = socks_listener.local_addr().unwrap();
+            let cfg = Arc::new(ProxyConfig { listen_addr: std::net::SocketAddr::from(([127,0,0,1],0)), socks_listen_addr: Some(socks_addr), ..config });
+            let counters = get_counters_for_port(socks_addr.port()).await;
+            let sc = Arc::new(SocksConnector::new(
+                cfg.socks_addr,
+                Arc::new(cfg.socks_auth.clone()),
+                Arc::new(cfg.vendor_password.clone()),
+                Arc::new(cfg.soax_settings.clone()),
+                Arc::new(cfg.connpnt_settings.clone()),
+            ));
+            let allowed = Arc::new(cfg.allowed_domains.clone());
+            let cfg_s = Arc::clone(&cfg);
+            let task = tokio::spawn(async move {
+                loop {
+                    let (stream, peer) = match socks_listener.accept().await { Ok(v)=>v, Err(_)=>break };
+                    let sc = Arc::clone(&sc); let ad = Arc::clone(&allowed); let cfg = Arc::clone(&cfg_s); let counters = Arc::clone(&counters);
+                    tokio::spawn(async move { let _ = handle_socks5_client(stream, peer, sc, ad, cfg, None, counters).await; });
+                }
+            });
+            (socks_addr, task)
+        }
+        let (socks_addr, socks_task) = spawn_dual(cfg).await;
+
+        // SOCKS client that performs RFC1929 auth then CONNECT and HTTP request
+        let mut c = tokio::net::TcpStream::connect(socks_addr).await.expect("connect socks");
+        // greeting offers username/password only
+        let _ = c.write_all(&[0x05,0x01,0x02]).await;
+        let mut sel=[0u8;2]; let _=c.read_exact(&mut sel).await; assert_eq!(sel, [0x05,0x02]);
+        // subnegotiation (version 1)
+        let u=b"user"; let p=b"pass";
+        let mut authmsg=Vec::with_capacity(2+u.len()+p.len());
+        authmsg.push(0x01); authmsg.push(u.len() as u8); authmsg.extend_from_slice(u); authmsg.push(p.len() as u8); authmsg.extend_from_slice(p);
+        let _=c.write_all(&authmsg).await; let mut ar=[0u8;2]; let _=c.read_exact(&mut ar).await; assert_eq!(ar, [0x01,0x00]);
+        // CONNECT
+        let host=b"example.com"; let mut req=Vec::new();
+        req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
+        let _=c.write_all(&req).await; let mut rep=[0u8;10]; let _=c.read_exact(&mut rep).await; assert_eq!(rep[1], 0x00);
+        // HTTP over tunnel
+        let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        let mut buf=Vec::new(); let mut tmp=[0u8;1024];
+        loop { match timeout(Duration::from_millis(800), c.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
+        let txt=String::from_utf8_lossy(&buf); assert!(txt.contains("200 OK"), "resp: {}", txt);
+
+        // Cleanup
+        socks_task.abort(); upstream_task.abort();
+    }
+
+
 }

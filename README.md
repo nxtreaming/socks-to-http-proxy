@@ -1,12 +1,12 @@
 # socks-to-http-proxy ![Rust](https://github.com/KaranGauswami/socks-to-http-proxy/workflows/Rust/badge.svg)
 
-An executable to convert SOCKS5 proxy into HTTP proxy
+A high-performance proxy that can: (1) expose an HTTP proxy that forwards via an upstream SOCKS5, (2) expose a SOCKS5 server that forwards via an upstream SOCKS5, and (3) optionally run both listeners at the same time on different ports.
 
 ## About
 
-`sthp` purpose is to create HTTP proxy on top of the Socks 5 Proxy
+`sthp` can run as an HTTP proxy on top of a SOCKS5 upstream, a SOCKS5→SOCKS5 forwarder, or both concurrently (HTTP+SOCKS).
 
-## How it works 
+## How it works
 
 It uses hyper library HTTP proxy [example](https://github.com/hyperium/hyper/blob/master/examples/http_proxy.rs) and adds functionality to connect via Socks5
 
@@ -28,6 +28,32 @@ sthp -p 8080 -s 127.0.0.1:1080
 This will create proxy server on 8080 and use localhost:1080 as a Socks5 Proxy
 
 See "Advanced Usage Examples" below for authentication and domain whitelist configurations.
+
+### Dual listeners: HTTP + SOCKS
+
+Run HTTP and SOCKS5 listeners at the same time (different ports):
+
+```bash
+sthp --http-port 8080 --socks-port 1081 -s 127.0.0.1:1080
+# HTTP client
+http_proxy=http://127.0.0.1:8080 curl http://example.com/
+# SOCKS client (server resolves domain)
+curl --socks5-hostname 127.0.0.1:1081 http://example.com/
+```
+
+Optional inbound SOCKS auth (for the local SOCKS server):
+```bash
+sthp --http-port 8080 --socks-port 1081 -s 127.0.0.1:1080 --socks-in-auth user:pass
+curl --socks5-hostname --socks5-user user --socks5-pass pass 127.0.0.1:1081 http://example.com/
+```
+
+### SOCKS server mode only
+
+Expose only a local SOCKS5 server that forwards via upstream SOCKS5:
+```bash
+sthp --mode socks -p 1081 -s 127.0.0.1:1080 [--socks-in-auth user:pass]
+```
+
 
 ### Advanced Usage Examples
 
@@ -87,8 +113,14 @@ Options:
   -u, --username <USERNAME>                Socks5 username
   -P, --password <PASSWORD>                Socks5/vendor password (-P): SOAX=package_key; Connpnt=vendor password
       --http-basic <USER:PASSWD>           HTTP Basic Auth
+      --mode <http|socks>                   Listen mode [default: http]
+      --http-port <PORT>                    HTTP listen port (overrides -p/--port)
+      --socks-port <PORT>                   Additional SOCKS5 listener port (enables dual listeners)
+
       --no-httpauth <1/0>                  Ignore HTTP Basic Auth [default: 1]
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
+      --socks-in-auth <USER:PASSWD>         Inbound SOCKS5 auth for local SOCKS server
+
       --allowed-domains <ALLOWED_DOMAINS>  Comma-separated list of allowed domains (supports exact, *.domain, .domain, or *)
       --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for CONNECT tunnels and regular HTTP requests [default: 540]
       --force-close <FORCE_CLOSE>          Force 'Connection: close' on forwarded HTTP requests [default: true]
@@ -238,6 +270,8 @@ Recommendations:
   - `GET /stats` → `{"port":<u16>,"rx":<u64>,"tx":<u64>}`
   - `POST /stats/reset` → `{"ok":true}` and immediately persists zeros
 
+- In dual-listener mode, these endpoints are available only on the HTTP listener.
+
 Examples:
 ```bash
 # If authentication is required (recommended), include Proxy-Authorization
@@ -251,6 +285,27 @@ curl -s -X POST http://127.0.0.1:8080/stats/reset \
 # Start with custom stats directory and 30s interval
 sthp -p 8080 -s 127.0.0.1:1080 --stats-dir ./stats --stats-interval 30
 ```
+
+
+## Tests (Unit & End-to-end)
+
+- Run all tests:
+  ```bash
+  cargo test
+  ```
+- End-to-end (E2E) coverage:
+  - Dual listeners running concurrently (HTTP + SOCKS): verifies real accept loops on two ports and concurrent client traffic
+    - Test: `dual_listeners_end_to_end`
+  - Inbound SOCKS5 authentication (RFC 1929) on the local SOCKS server:
+    - Test: `socks_inbound_auth_end_to_end`
+- Notes:
+  - Tests bind to `127.0.0.1` using ephemeral ports and do not reach the external network
+  - They simulate an upstream SOCKS5 server in-process and validate a full HTTP round-trip (`200 OK`)
+  - To run a single test:
+    ```bash
+    cargo test dual_listeners_end_to_end
+    cargo test socks_inbound_auth_end_to_end
+    ```
 
 
 

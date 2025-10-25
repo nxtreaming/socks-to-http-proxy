@@ -2,6 +2,17 @@ use clap::{value_parser, Args, Parser};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use clap::ValueEnum;
+
+/// Listen mode for the proxy server
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ListenMode {
+    /// HTTP proxy -> upstream SOCKS5
+    Http,
+    /// SOCKS5 proxy -> upstream SOCKS5
+    Socks,
+}
+
 /// SOCKS5 authentication credentials
 #[derive(Debug, Clone, Args)]
 pub struct Auths {
@@ -20,26 +31,42 @@ pub struct Auths {
 #[derive(Parser, Debug)]
 #[command(
     author, version,
-    about = "Convert a SOCKS5 proxy into an HTTP proxy",
-    long_about = "sthp converts a SOCKS5 proxy into an HTTP proxy.\n\nKey features:\n- HTTP proxy over SOCKS5 (with optional HTTP Basic and SOCKS auth)\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints: GET /stats, POST /stats/reset (auth policy applies)\n"
+    about = "SOCKS/HTTP proxy forwarder",
+    long_about = "sthp converts between protocols and forwards via an upstream SOCKS5 proxy.\n\nModes:\n- http  : HTTP proxy -> upstream SOCKS5 (existing)\n- socks : SOCKS5 proxy -> upstream SOCKS5 (new)\n\nFeatures:\n- Optional HTTP Basic or inbound SOCKS5 auth\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints (HTTP mode only): GET /stats, POST /stats/reset\n"
 )]
 
 pub struct Cli {
-    /// Port where HTTP proxy should listen
+    /// Listen mode: http or socks
+    #[arg(long, value_enum, default_value_t = ListenMode::Http)]
+    pub mode: ListenMode,
+
+    /// Port to listen on (HTTP). Use --http-port to override.
     #[arg(short, long, default_value_t = 8080)]
     pub port: u16,
 
-    /// IP address to bind the HTTP proxy server
+    /// HTTP listen port (overrides --port when provided)
+    #[arg(long = "http-port")]
+    pub http_port: Option<u16>,
+
+    /// Optional extra SOCKS5 listen port to enable concurrent SOCKS server
+    #[arg(long = "socks-port")]
+    pub socks_port: Option<u16>,
+
+    /// IP address to bind the server (applies to both HTTP and SOCKS listeners)
     #[arg(long, default_value = "0.0.0.0")]
     pub listen_ip: Ipv4Addr,
 
-    /// SOCKS5 authentication credentials
+    /// SOCKS5 authentication credentials for upstream server
     #[command(flatten)]
     pub auth: Option<Auths>,
 
-    /// SOCKS5 proxy address or hostname:port
+    /// Upstream SOCKS5 proxy address or hostname:port
     #[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
     pub socks_address: String,
+
+    /// Inbound SOCKS5 auth for socks mode (format: user:pass)
+    #[arg(long = "socks-in-auth")]
+    pub socks_in_auth: Option<String>,
 
     /// Enable SOAX sticky session per client connection: 1 or 0
     #[arg(long = "soax-sticky", value_parser = value_parser!(u8).range(0..=1), default_value_t = 0)]
@@ -117,7 +144,7 @@ pub struct Cli {
     #[arg(long)]
     pub http_basic: Option<String>,
 
-    /// Disable HTTP authentication: 1 or 0
+    /// Disable HTTP authentication: 1 or 0 (HTTP mode only)
     #[arg(long, value_parser = value_parser!(u8).range(0..=1), default_value_t = 1)]
     pub no_httpauth: u8,
 
@@ -309,8 +336,11 @@ impl SoaxSettings {
 /// Proxy server configuration derived from CLI arguments
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
+    pub mode: ListenMode,
     pub listen_addr: std::net::SocketAddr,
     pub socks_addr: std::net::SocketAddr,
+    pub socks_listen_addr: Option<std::net::SocketAddr>,
+
     pub allowed_domains: Option<HashSet<String>>,
     pub http_basic_auth: Option<hyper::header::HeaderValue>,
     pub no_httpauth: bool,
@@ -320,6 +350,7 @@ pub struct ProxyConfig {
     pub soax_settings: SoaxSettings,
     pub vendor_password: Option<String>,
     pub socks_auth: Option<crate::auth::Auth>,
+    pub socks_in_auth: Option<crate::auth::Auth>,
     pub stats_dir: Option<String>,
     pub stats_interval: u64,
     pub connpnt_settings: ConnpntSettings,
@@ -341,8 +372,14 @@ impl ProxyConfig {
             Err(e) => return Err(color_eyre::eyre::eyre!("Failed to resolve {}: {}", args.socks_address, e)),
         };
 
-        // Create listen address
-        let listen_addr = std::net::SocketAddr::from((args.listen_ip, args.port));
+        // Create HTTP listen address (supports --http-port override)
+        let http_port = args.http_port.unwrap_or(args.port);
+        let listen_addr = std::net::SocketAddr::from((args.listen_ip, http_port));
+
+        // Optional extra SOCKS listener address when --socks-port is provided
+        let socks_listen_addr = args
+            .socks_port
+            .map(|p| std::net::SocketAddr::from((args.listen_ip, p)));
 
         // Convert allowed domains to HashSet
         let allowed_domains = args.allowed_domains.clone().map(|v| {
@@ -381,8 +418,24 @@ impl ProxyConfig {
         connpnt_settings.validate(&vendor_password)
             .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
+        // Inbound SOCKS5 auth (socks mode)
+        let socks_in_auth = match args.socks_in_auth.as_ref() {
+            Some(s) => {
+                let mut parts = s.splitn(2, ':');
+                let u = parts.next().unwrap_or("").to_string();
+                let p = parts.next().unwrap_or("").to_string();
+                if u.is_empty() || p.is_empty() {
+                    return Err(color_eyre::eyre::eyre!("Invalid --socks-in-auth, expected user:pass"));
+                }
+                Some(crate::auth::Auth::new(u, p))
+            }
+            None => None,
+        };
+
         Ok(Self {
+            mode: args.mode,
             listen_addr,
+            socks_listen_addr,
             socks_addr,
             allowed_domains,
             http_basic_auth,
@@ -393,6 +446,7 @@ impl ProxyConfig {
             soax_settings,
             vendor_password,
             socks_auth,
+            socks_in_auth,
             stats_dir: args.stats_dir.clone(),
             stats_interval: args.stats_interval,
             connpnt_settings,
