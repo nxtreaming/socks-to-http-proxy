@@ -1,12 +1,11 @@
 [package]
 name = "sthp"
-version = "0.9.1"
+version = "0.9.2"
 license = "MIT"
 authors = ["Blackswan <nxtreaming@gmail.com>"]
 edition = "2021"
 categories = ["command-line-utilities"]
 description = "Convert Socks5 proxy into Http proxy"
-
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
