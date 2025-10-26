@@ -55,6 +55,11 @@ sthp --mode socks -p 1081 -s 127.0.0.1:1080 [--socks-in-auth user:pass]
 ```
 
 
+Note (SOCKS inbound, security):
+- Handshake reads enforce a 10s per-step timeout to mitigate slowloris attacks
+- The SOCKS request reserved field (RSV) must be 0x00; non-zero RSV is rejected with a general failure (REP=0x01)
+
+
 ### Advanced Usage Examples
 
 - Require HTTP proxy auth and allow only example.com (apex + subdomains):

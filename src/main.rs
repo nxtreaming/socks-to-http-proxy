@@ -51,7 +51,6 @@ use pin_project::{pin_project, pinned_drop};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
 enum CountDir {
@@ -284,7 +283,6 @@ async fn main() -> Result<()> {
         }
     }
 
-
     // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
@@ -381,7 +379,6 @@ async fn main() -> Result<()> {
     let hb_for_server = Arc::clone(&http_basic);
     let ad_for_server = Arc::clone(&allowed_domains);
     let cfg_for_server = Arc::clone(&config);
-
 
     // Main server loop
     let server = async move {
@@ -1069,6 +1066,20 @@ async fn tunnel(
     Ok(())
 }
 
+// Read exactly buf.len() bytes from stream within the given duration; used for SOCKS5 handshakes
+async fn read_exact_timeout(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut [u8],
+    dur: std::time::Duration,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    match tokio::time::timeout(dur, stream.read_exact(buf)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake read timeout")),
+    }
+}
+
 async fn handle_socks5_client(
     mut client: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -1096,17 +1107,20 @@ async fn handle_socks5_client(
             .into());
         }
     };
+    // Per-step read timeout for SOCKS5 handshake/auth/request to mitigate slowloris
+    let hs_timeout = std::time::Duration::from_secs(10);
 
     // 1) Handshake: read methods
     let mut header = [0u8; 2];
-    client.read_exact(&mut header).await?;
+    read_exact_timeout(&mut client, &mut header, hs_timeout).await?;
+
     if header[0] != 0x05 {
         return Err(color_eyre::eyre::eyre!("Unsupported SOCKS version {}", header[0]));
     }
     let nmethods = header[1] as usize;
     let mut methods = vec![0u8; nmethods];
     if nmethods > 0 {
-        client.read_exact(&mut methods).await?;
+        read_exact_timeout(&mut client, &mut methods, hs_timeout).await?;
     }
     let need_auth = config.socks_in_auth.is_some();
     let chosen = if need_auth { 0x02 } else { 0x00 };
@@ -1124,26 +1138,26 @@ async fn handle_socks5_client(
     // 2) Optional username/password auth (RFC 1929)
     if chosen == 0x02 {
         let mut ver = [0u8; 1];
-        client.read_exact(&mut ver).await?;
+        read_exact_timeout(&mut client, &mut ver, hs_timeout).await?;
         if ver[0] != 0x01 {
             let _ = client.write_all(&[0x01, 0x01]).await; // failure
             return Err(color_eyre::eyre::eyre!("Invalid auth version {}", ver[0]));
         }
         // username
         let mut ulen = [0u8; 1];
-        client.read_exact(&mut ulen).await?;
+        read_exact_timeout(&mut client, &mut ulen, hs_timeout).await?;
         let ulen = ulen[0] as usize;
         let mut ubuf = vec![0u8; ulen];
         if ulen > 0 {
-            client.read_exact(&mut ubuf).await?;
+            read_exact_timeout(&mut client, &mut ubuf, hs_timeout).await?;
         }
         // password
         let mut plen = [0u8; 1];
-        client.read_exact(&mut plen).await?;
+        read_exact_timeout(&mut client, &mut plen, hs_timeout).await?;
         let plen = plen[0] as usize;
         let mut pbuf = vec![0u8; plen];
         if plen > 0 {
-            client.read_exact(&mut pbuf).await?;
+            read_exact_timeout(&mut client, &mut pbuf, hs_timeout).await?;
         }
         let user = String::from_utf8_lossy(&ubuf).to_string();
         let pass = String::from_utf8_lossy(&pbuf).to_string();
@@ -1160,7 +1174,7 @@ async fn handle_socks5_client(
 
     // 3) Request: CONNECT only
     let mut req_hdr = [0u8; 4];
-    client.read_exact(&mut req_hdr).await?;
+    read_exact_timeout(&mut client, &mut req_hdr, hs_timeout).await?;
     if req_hdr[0] != 0x05 {
         return Err(color_eyre::eyre::eyre!("Invalid request version {}", req_hdr[0]));
     }
@@ -1171,6 +1185,14 @@ async fn handle_socks5_client(
             .await;
         return Err(color_eyre::eyre::eyre!("Unsupported SOCKS5 cmd {}", req_hdr[1]));
     }
+    // Strictly validate reserved field (RSV) must be 0x00
+    if req_hdr[2] != 0x00 {
+        let _ = client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await; // general failure
+        return Err(color_eyre::eyre::eyre!("Invalid RSV in SOCKS5 request: {}", req_hdr[2]));
+    }
+
     let atyp = req_hdr[3];
 
     // destination address
@@ -1179,9 +1201,9 @@ async fn handle_socks5_client(
         0x01 => {
             // IPv4
             let mut ip = [0u8; 4];
-            client.read_exact(&mut ip).await?;
+            read_exact_timeout(&mut client, &mut ip, hs_timeout).await?;
             let mut portb = [0u8; 2];
-            client.read_exact(&mut portb).await?;
+            read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let host = std::net::Ipv4Addr::from(ip);
             format!("{}:{}", host, port)
@@ -1189,12 +1211,12 @@ async fn handle_socks5_client(
         0x03 => {
             // Domain
             let mut len = [0u8; 1];
-            client.read_exact(&mut len).await?;
+            read_exact_timeout(&mut client, &mut len, hs_timeout).await?;
             let len = len[0] as usize;
             let mut dom = vec![0u8; len];
-            if len > 0 { client.read_exact(&mut dom).await?; }
+            if len > 0 { read_exact_timeout(&mut client, &mut dom, hs_timeout).await?; }
             let mut portb = [0u8; 2];
-            client.read_exact(&mut portb).await?;
+            read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let domain = String::from_utf8_lossy(&dom).to_string();
             domain_opt = Some(domain.clone());
@@ -1203,9 +1225,9 @@ async fn handle_socks5_client(
         0x04 => {
             // IPv6
             let mut ip = [0u8; 16];
-            client.read_exact(&mut ip).await?;
+            read_exact_timeout(&mut client, &mut ip, hs_timeout).await?;
             let mut portb = [0u8; 2];
-            client.read_exact(&mut portb).await?;
+            read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let host = std::net::Ipv6Addr::from(ip);
             format!("[{}]:{}", host, port)
@@ -1240,10 +1262,18 @@ async fn handle_socks5_client(
         }
     };
 
-    // 5) Reply success to client
-    client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    // 5) Reply success to client with local bound address (use inbound local socket info)
+    let local = client.local_addr().ok();
+    let (atyp, addr_bytes, port_bytes) = match local {
+        Some(std::net::SocketAddr::V4(v4)) => (0x01u8, v4.ip().octets().to_vec(), v4.port().to_be_bytes()),
+        Some(std::net::SocketAddr::V6(v6)) => (0x04u8, v6.ip().octets().to_vec(), v6.port().to_be_bytes()),
+        None => (0x01u8, [0u8;4].to_vec(), 0u16.to_be_bytes()),
+    };
+    let mut reply = Vec::with_capacity(4 + addr_bytes.len() + 2);
+    reply.extend_from_slice(&[0x05, 0x00, 0x00, atyp]);
+    reply.extend_from_slice(&addr_bytes);
+    reply.extend_from_slice(&port_bytes);
+    client.write_all(&reply).await?;
 
     // 6) Bidirectional copy with idle timeout and traffic counters
     let timeout = tokio::time::Duration::from_secs(config.idle_timeout);
@@ -1590,59 +1620,58 @@ mod tests {
         let _ = server.await;
     }
 
+    #[tokio::test]
+    async fn stats_endpoints_dual_listener_http_port() {
+        use hyper::Request;
+        use http_body_util::BodyExt;
 
-        #[tokio::test]
-        async fn stats_endpoints_dual_listener_http_port() {
-            use hyper::Request;
-            use http_body_util::BodyExt;
+        let http_port = 18089u16;
+        let socks_port = 18090u16;
+        reset_port(http_port).await;
+        reset_port(socks_port).await;
 
-            let http_port = 18089u16;
-            let socks_port = 18090u16;
-            reset_port(http_port).await;
-            reset_port(socks_port).await;
+        let http_counters = get_counters_for_port(http_port).await;
+        http_counters.set(111, 222);
+        let socks_counters = get_counters_for_port(socks_port).await;
+        socks_counters.set(333, 444);
 
-            let http_counters = get_counters_for_port(http_port).await;
-            http_counters.set(111, 222);
-            let socks_counters = get_counters_for_port(socks_port).await;
-            socks_counters.set(333, 444);
+        let mut cfg = base_proxy_config(http_port);
+        cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], socks_port)));
+        cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_dual").to_string_lossy().to_string());
+        let config = Arc::new(cfg);
 
-            let mut cfg = base_proxy_config(http_port);
-            cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], socks_port)));
-            cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_dual").to_string_lossy().to_string());
-            let config = Arc::new(cfg);
+        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), http_counters.clone()).await;
 
-            let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), http_counters.clone()).await;
+        // GET /stats should return HTTP port counters
+        let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
+        let mut resp = sender.send_request(req).await.expect("send stats");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains(&format!("\"port\":{}", http_port)));
+        assert!(body.contains("\"rx\":111"));
+        assert!(body.contains("\"tx\":222"));
 
-            // GET /stats should return HTTP port counters
-            let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
-            let mut resp = sender.send_request(req).await.expect("send stats");
-            assert_eq!(resp.status(), http::StatusCode::OK);
-            let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
-            let body = String::from_utf8_lossy(&body_bytes);
-            assert!(body.contains(&format!("\"port\":{}", http_port)));
-            assert!(body.contains("\"rx\":111"));
-            assert!(body.contains("\"tx\":222"));
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
 
-            drop(sender);
-            let _ = client_task.await;
-            let _ = server.await;
-        }
+    #[test]
+    fn get_stats_path_distinct_files() {
+        let port_a = 19001u16;
+        let port_b = 19002u16;
+        let mut cfg = base_proxy_config(port_a);
+        cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_paths").to_string_lossy().to_string());
+        // Even if we set socks_listen_addr, file names must depend on the queried port
+        cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], port_b)));
 
-        #[test]
-        fn get_stats_path_distinct_files() {
-            let port_a = 19001u16;
-            let port_b = 19002u16;
-            let mut cfg = base_proxy_config(port_a);
-            cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test_paths").to_string_lossy().to_string());
-            // Even if we set socks_listen_addr, file names must depend on the queried port
-            cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], port_b)));
-
-            let pa = super::get_stats_path(&cfg, port_a);
-            let pb = super::get_stats_path(&cfg, port_b);
-            assert_ne!(pa, pb, "expected different stats files per port");
-            assert!(pa.to_string_lossy().contains(&port_a.to_string()));
-            assert!(pb.to_string_lossy().contains(&port_b.to_string()));
-        }
+        let pa = super::get_stats_path(&cfg, port_a);
+        let pb = super::get_stats_path(&cfg, port_b);
+        assert_ne!(pa, pb, "expected different stats files per port");
+        assert!(pa.to_string_lossy().contains(&port_a.to_string()));
+        assert!(pb.to_string_lossy().contains(&port_b.to_string()));
+    }
 
     #[tokio::test]
     async fn authenticated_request_strips_proxy_headers() {
@@ -1986,7 +2015,15 @@ mod tests {
             let mut sel=[0u8;2]; let _=c.read_exact(&mut sel).await; assert_eq!(sel, [0x05,0x00]);
             let host=b"example.com"; let mut req=Vec::with_capacity(4+1+host.len()+2);
             req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
-            let _=c.write_all(&req).await; let mut rep=[0u8;10]; let _=c.read_exact(&mut rep).await; assert_eq!(rep[1], 0x00);
+            let _=c.write_all(&req).await;
+            let mut head=[0u8;4]; let _=c.read_exact(&mut head).await; assert_eq!(head[0], 0x05); assert_eq!(head[1], 0x00);
+            match head[3] {
+                0x01 => { let mut b=[0u8;4]; let _=c.read_exact(&mut b).await; }
+                0x04 => { let mut b=[0u8;16]; let _=c.read_exact(&mut b).await; }
+                0x03 => { let mut l=[0u8;1]; let _=c.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=c.read_exact(&mut d).await; } }
+                _ => {}
+            }
+            let mut port=[0u8;2]; let _=c.read_exact(&mut port).await;
             let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
             let mut buf=Vec::new(); let mut tmp=[0u8;1024];
             loop { match timeout(Duration::from_millis(800), c.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
@@ -2078,7 +2115,15 @@ mod tests {
         // CONNECT
         let host=b"example.com"; let mut req=Vec::new();
         req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
-        let _=c.write_all(&req).await; let mut rep=[0u8;10]; let _=c.read_exact(&mut rep).await; assert_eq!(rep[1], 0x00);
+        let _=c.write_all(&req).await;
+        let mut head=[0u8;4]; let _=c.read_exact(&mut head).await; assert_eq!(head[0], 0x05); assert_eq!(head[1], 0x00);
+        match head[3] {
+            0x01 => { let mut b=[0u8;4]; let _=c.read_exact(&mut b).await; }
+            0x04 => { let mut b=[0u8;16]; let _=c.read_exact(&mut b).await; }
+            0x03 => { let mut l=[0u8;1]; let _=c.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=c.read_exact(&mut d).await; } }
+            _ => {}
+        }
+        let mut port=[0u8;2]; let _=c.read_exact(&mut port).await;
         // HTTP over tunnel
         let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
         let mut buf=Vec::new(); let mut tmp=[0u8;1024];
@@ -2088,6 +2133,4 @@ mod tests {
         // Cleanup
         socks_task.abort(); upstream_task.abort();
     }
-
-
 }
