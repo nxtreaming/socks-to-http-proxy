@@ -265,13 +265,7 @@ async fn main() -> Result<()> {
     };
 
     // Create SOCKS5 connector
-    let socks_connector = Arc::new(SocksConnector::new(
-        config.socks_addr,
-        Arc::new(config.socks_auth.clone()),
-        Arc::new(config.vendor_password.clone()),
-        Arc::new(config.soax_settings.clone()),
-        Arc::new(config.connpnt_settings.clone()),
-    ));
+    let socks_connector = build_socks_connector(config.as_ref());
 
     let listener = TcpListener::bind(config.listen_addr).await?;
     // Optional extra SOCKS listener bound if configured
@@ -386,30 +380,12 @@ async fn main() -> Result<()> {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     // Check per-IP connection limits atomically
-                    let ip_tracker = get_ip_tracker();
                     let client_ip = peer_addr.ip();
                     let conn_limit = cfg_for_server.conn_per_ip;
-
-                    // Atomically check and increment connection count
-                    let new_count = match ip_tracker.try_increment(client_ip, conn_limit).await {
-                        Some(count) => count,
-                        None => {
-                            let current_count = ip_tracker.get_count(client_ip).await;
-                            warn!(
-                                "Connection limit exceeded for IP {}: {} connections (limit: {})",
-                                client_ip, current_count, conn_limit
-                            );
-                            // Close the connection immediately
-                            drop(stream);
-                            continue;
-                        }
-                    };
-
-                    if new_count > 20 {
-                        info!(
-                            "High connection count for IP {}: {} connections",
-                            client_ip, new_count
-                        );
+                    if try_register_connection(client_ip, conn_limit).await.is_none() {
+                        // Close the connection immediately
+                        drop(stream);
+                        continue;
                     }
 
                     // Clone Arc references for the spawned task
@@ -469,7 +445,7 @@ async fn main() -> Result<()> {
                         }
 
                         // Decrement IP connection count when connection ends
-                        ip_tracker.decrement(client_ip).await;
+                        get_ip_tracker().decrement(client_ip).await;
                     });
                 }
                 Err(e) => {
@@ -490,27 +466,13 @@ async fn main() -> Result<()> {
             loop {
                 match listener2.accept().await {
                     Ok((stream, peer_addr)) => {
-                        let ip_tracker = get_ip_tracker();
                         let client_ip = peer_addr.ip();
                         let conn_limit = config.conn_per_ip;
-                        let new_count = match ip_tracker.try_increment(client_ip, conn_limit).await {
-                            Some(count) => count,
-                            None => {
-                                let current_count = ip_tracker.get_count(client_ip).await;
-                                warn!(
-                                    "Connection limit exceeded for IP {}: {} connections (limit: {})",
-                                    client_ip, current_count, conn_limit
-                                );
-                                drop(stream);
-                                continue;
-                            }
-                        };
-                        if new_count > 20 {
-                            info!(
-                                "High connection count for IP {}: {} connections",
-                                client_ip, new_count
-                            );
+                        if try_register_connection(client_ip, conn_limit).await.is_none() {
+                            drop(stream);
+                            continue;
                         }
+
                         let socks_connector = Arc::clone(&socks_connector);
                         let allowed_domains = Arc::clone(&allowed_domains);
                         let config = Arc::clone(&config);
@@ -528,7 +490,7 @@ async fn main() -> Result<()> {
                             ).await {
                                 warn!("SOCKS5 client {} error: {:?}", peer_addr, err);
                             }
-                            ip_tracker.decrement(client_ip).await;
+                            get_ip_tracker().decrement(client_ip).await;
                         });
                     }
                     Err(e) => {
@@ -1080,6 +1042,38 @@ async fn read_exact_timeout(
     }
 }
 
+// Helper: build a SocksConnector from config to avoid duplicate field cloning
+fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
+    Arc::new(SocksConnector::new(
+        cfg.socks_addr,
+        Arc::new(cfg.socks_auth.clone()),
+        Arc::new(cfg.vendor_password.clone()),
+        Arc::new(cfg.soax_settings.clone()),
+        Arc::new(cfg.connpnt_settings.clone()),
+    ))
+}
+
+// Helper: register per-IP connection; returns Some(count) if allowed, None if rejected
+async fn try_register_connection(client_ip: std::net::IpAddr, conn_limit: usize) -> Option<usize> {
+    let ip_tracker = get_ip_tracker();
+    match ip_tracker.try_increment(client_ip, conn_limit).await {
+        Some(count) => {
+            if count > 20 {
+                info!("High connection count for IP {}: {} connections", client_ip, count);
+            }
+            Some(count)
+        }
+        None => {
+            let current_count = ip_tracker.get_count(client_ip).await;
+            warn!(
+                "Connection limit exceeded for IP {}: {} connections (limit: {})",
+                client_ip, current_count, conn_limit
+            );
+            None
+        }
+    }
+}
+
 async fn handle_socks5_client(
     mut client: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -1441,6 +1435,96 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use serial_test::serial;
 
+    // Test helpers to reduce duplicated fragments (available to all tests below)
+    // Read from stream until CRLFCRLF or timeout between reads; returns accumulated bytes
+    async fn read_until_header_end(
+        stream: &mut tokio::net::TcpStream,
+        step_timeout: Duration,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(step_timeout, stream.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        buf
+    }
+
+    // Spawn a SOCKS accept loop that forwards clients to handle_socks5_client
+    fn spawn_socks_accept_loop(
+        socks_listener: TcpListener,
+        sc: Arc<SocksConnector>,
+        allowed: Arc<Option<HashSet<String>>>,
+        cfg: Arc<ProxyConfig>,
+        counters: Arc<TrafficCounters>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match socks_listener.accept().await { Ok(v) => v, Err(_) => break };
+                let sc = Arc::clone(&sc);
+                let ad = Arc::clone(&allowed);
+                let cfg = Arc::clone(&cfg);
+                let counters = Arc::clone(&counters);
+                tokio::spawn(async move {
+                    let _ = handle_socks5_client(stream, peer, sc, ad, cfg, None, counters).await;
+                });
+            }
+        })
+    }
+
+    async fn spawn_fake_socks_upstream() -> (std::net::SocketAddr, JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream socks");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(v) => v, Err(_) => break };
+                let mut g=[0u8;2]; if stream.read_exact(&mut g).await.is_err() { break; }
+                let mut methods = vec![0u8; g[1] as usize]; if g[1]>0 { if stream.read_exact(&mut methods).await.is_err() { break; } }
+                let _ = stream.write_all(&[0x05,0x00]).await; // no-auth
+                let mut h=[0u8;4]; if stream.read_exact(&mut h).await.is_err() { break; }
+                match h[3] {
+                    0x01 => { let mut b=[0u8;4]; let _=stream.read_exact(&mut b).await; }
+                    0x03 => { let mut l=[0u8;1]; let _=stream.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=stream.read_exact(&mut d).await; } }
+                    0x04 => { let mut b=[0u8;16]; let _=stream.read_exact(&mut b).await; }
+                    _ => {}
+                }
+                let mut port=[0u8;2]; let _=stream.read_exact(&mut port).await;
+                let _ = stream.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await; // success
+                let _ = read_until_header_end(&mut stream, Duration::from_millis(500)).await;
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+        (addr, task)
+    }
+
+    async fn verify_socks_success_and_http_ok(c: &mut tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut head=[0u8;4]; let _=c.read_exact(&mut head).await; assert_eq!(head[0], 0x05); assert_eq!(head[1], 0x00);
+        match head[3] {
+            0x01 => { let mut b=[0u8;4]; let _=c.read_exact(&mut b).await; }
+            0x04 => { let mut b=[0u8;16]; let _=c.read_exact(&mut b).await; }
+            0x03 => { let mut l=[0u8;1]; let _=c.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=c.read_exact(&mut d).await; } }
+            _ => {}
+        }
+        let mut port=[0u8;2]; let _=c.read_exact(&mut port).await;
+        let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        let buf = read_until_header_end(c, Duration::from_millis(800)).await;
+        let txt=String::from_utf8_lossy(&buf); assert!(txt.contains("200 OK"), "resp: {}", txt);
+    }
+
     #[test]
     fn test_http_basic_auth_header_creation() {
         // Test that we can create HeaderValue from HTTP Basic auth string
@@ -1666,8 +1750,8 @@ mod tests {
         // Even if we set socks_listen_addr, file names must depend on the queried port
         cfg.socks_listen_addr = Some(std::net::SocketAddr::from(([127,0,0,1], port_b)));
 
-        let pa = super::get_stats_path(&cfg, port_a);
-        let pb = super::get_stats_path(&cfg, port_b);
+        let pa = get_stats_path(&cfg, port_a);
+        let pb = get_stats_path(&cfg, port_b);
         assert_ne!(pa, pb, "expected different stats files per port");
         assert!(pa.to_string_lossy().contains(&port_a.to_string()));
         assert!(pb.to_string_lossy().contains(&port_b.to_string()));
@@ -1907,44 +1991,13 @@ mod tests {
 
     #[tokio::test]
     async fn dual_listeners_end_to_end() {
-        use tokio::time::{timeout, Duration};
         use hyper::client::conn::http1::Builder as ClientBuilder;
         use hyper_util::rt::TokioIo;
         use hyper::Request;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // 1) Fake upstream SOCKS5 server that replies 200 OK for any CONNECT tunnel
-        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream socks");
-        let upstream_addr = upstream.local_addr().unwrap();
-        let upstream_task = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = match upstream.accept().await { Ok(v) => v, Err(_) => break };
-                // greeting
-                let mut g = [0u8;2]; if stream.read_exact(&mut g).await.is_err() { break; }
-                let mut methods = vec![0u8; g[1] as usize]; if g[1] > 0 { if stream.read_exact(&mut methods).await.is_err() { break; } }
-                let _ = stream.write_all(&[0x05, 0x00]).await; // no-auth
-                // request header
-                let mut h = [0u8;4]; if stream.read_exact(&mut h).await.is_err() { break; }
-                match h[3] { // ATYP consume address
-                    0x01 => { let mut b=[0u8;4]; let _=stream.read_exact(&mut b).await; }
-                    0x03 => { let mut l=[0u8;1]; let _=stream.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=stream.read_exact(&mut d).await; } }
-                    0x04 => { let mut b=[0u8;16]; let _=stream.read_exact(&mut b).await; }
-                    _ => {}
-                }
-                let mut port=[0u8;2]; let _=stream.read_exact(&mut port).await;
-                let _ = stream.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await; // success
-                // Read until end of HTTP headers then respond 200
-                let mut buf = Vec::new(); let mut tmp=[0u8;1024];
-                loop {
-                    match timeout(Duration::from_millis(500), stream.read(&mut tmp)).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => { buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } },
-                        _ => break,
-                    }
-                }
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
-            }
-        });
+        let (upstream_addr, upstream_task) = spawn_fake_socks_upstream().await;
 
         // 2) Start our proxy with dual listeners on ephemeral ports
         let mut cfg = base_proxy_config(0);
@@ -1968,13 +2021,7 @@ mod tests {
             let allowed = Arc::new(cfg.allowed_domains.clone());
             let counters_http = get_counters_for_port(http_addr.port()).await;
             let counters_socks = get_counters_for_port(socks_addr.port()).await;
-            let socks_connector = Arc::new(SocksConnector::new(
-                cfg.socks_addr,
-                Arc::new(cfg.socks_auth.clone()),
-                Arc::new(cfg.vendor_password.clone()),
-                Arc::new(cfg.soax_settings.clone()),
-                Arc::new(cfg.connpnt_settings.clone()),
-            ));
+            let socks_connector = build_socks_connector(cfg.as_ref());
             let cfg_h = Arc::clone(&cfg); let sc_h = Arc::clone(&socks_connector); let allowed_h = Arc::clone(&allowed); let http_basic_h = Arc::clone(&http_basic); let counters_h = Arc::clone(&counters_http);
             let h_task = tokio::spawn(async move {
                 loop {
@@ -1987,13 +2034,7 @@ mod tests {
                 }
             });
             let sc_s = Arc::clone(&socks_connector); let allowed_s = Arc::clone(&allowed); let cfg_s = Arc::clone(&cfg); let counters_s = Arc::clone(&counters_socks);
-            let s_task = tokio::spawn(async move {
-                loop {
-                    let (stream, peer) = match socks_listener.accept().await { Ok(v)=>v, Err(_)=>break };
-                    let sc = Arc::clone(&sc_s); let ad = Arc::clone(&allowed_s); let cfg = Arc::clone(&cfg_s); let counters = Arc::clone(&counters_s);
-                    tokio::spawn(async move { let _ = handle_socks5_client(stream, peer, sc, ad, cfg, None, counters).await; });
-                }
-            });
+            let s_task = spawn_socks_accept_loop(socks_listener, sc_s, allowed_s, cfg_s, counters_s);
             (http_addr, socks_addr, h_task, s_task)
         }
         let (http_addr, socks_addr, http_task, socks_task) = spawn_dual(cfg).await;
@@ -2016,18 +2057,7 @@ mod tests {
             let host=b"example.com"; let mut req=Vec::with_capacity(4+1+host.len()+2);
             req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
             let _=c.write_all(&req).await;
-            let mut head=[0u8;4]; let _=c.read_exact(&mut head).await; assert_eq!(head[0], 0x05); assert_eq!(head[1], 0x00);
-            match head[3] {
-                0x01 => { let mut b=[0u8;4]; let _=c.read_exact(&mut b).await; }
-                0x04 => { let mut b=[0u8;16]; let _=c.read_exact(&mut b).await; }
-                0x03 => { let mut l=[0u8;1]; let _=c.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=c.read_exact(&mut d).await; } }
-                _ => {}
-            }
-            let mut port=[0u8;2]; let _=c.read_exact(&mut port).await;
-            let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
-            let mut buf=Vec::new(); let mut tmp=[0u8;1024];
-            loop { match timeout(Duration::from_millis(800), c.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
-            let txt=String::from_utf8_lossy(&buf); assert!(txt.contains("200 OK"), "resp: {}", txt);
+            verify_socks_success_and_http_ok(&mut c).await;
         };
         let _ = tokio::join!(http_fut, socks_fut);
 
@@ -2037,36 +2067,11 @@ mod tests {
 
     #[tokio::test]
     async fn socks_inbound_auth_end_to_end() {
-        use tokio::time::{timeout, Duration};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use crate::auth::Auth;
 
         // Fake upstream SOCKS5 server (no-auth) that responds 200 OK over tunnel
-        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
-        let upstream_addr = upstream.local_addr().unwrap();
-        let upstream_task = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = match upstream.accept().await { Ok(v)=>v, Err(_)=>break };
-                // greeting
-                let mut g=[0u8;2]; if stream.read_exact(&mut g).await.is_err() { break; }
-                let mut methods = vec![0u8; g[1] as usize]; if g[1]>0 { if stream.read_exact(&mut methods).await.is_err() { break; } }
-                let _ = stream.write_all(&[0x05,0x00]).await; // select no-auth
-                // request header + consume dest
-                let mut h=[0u8;4]; if stream.read_exact(&mut h).await.is_err() { break; }
-                match h[3] {
-                    0x01 => { let mut b=[0u8;4]; let _=stream.read_exact(&mut b).await; }
-                    0x03 => { let mut l=[0u8;1]; let _=stream.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=stream.read_exact(&mut d).await; } }
-                    0x04 => { let mut b=[0u8;16]; let _=stream.read_exact(&mut b).await; }
-                    _ => {}
-                }
-                let mut port=[0u8;2]; let _=stream.read_exact(&mut port).await;
-                let _ = stream.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await; // success
-                // Read HTTP headers then reply 200
-                let mut buf=Vec::new(); let mut tmp=[0u8;1024];
-                loop { match timeout(Duration::from_millis(500), stream.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
-            }
-        });
+        let (upstream_addr, upstream_task) = spawn_fake_socks_upstream().await;
 
         // Start proxy with inbound SOCKS auth required
         let mut cfg = base_proxy_config(0);
@@ -2082,22 +2087,10 @@ mod tests {
             let socks_addr = socks_listener.local_addr().unwrap();
             let cfg = Arc::new(ProxyConfig { listen_addr: std::net::SocketAddr::from(([127,0,0,1],0)), socks_listen_addr: Some(socks_addr), ..config });
             let counters = get_counters_for_port(socks_addr.port()).await;
-            let sc = Arc::new(SocksConnector::new(
-                cfg.socks_addr,
-                Arc::new(cfg.socks_auth.clone()),
-                Arc::new(cfg.vendor_password.clone()),
-                Arc::new(cfg.soax_settings.clone()),
-                Arc::new(cfg.connpnt_settings.clone()),
-            ));
+            let sc = build_socks_connector(cfg.as_ref());
             let allowed = Arc::new(cfg.allowed_domains.clone());
             let cfg_s = Arc::clone(&cfg);
-            let task = tokio::spawn(async move {
-                loop {
-                    let (stream, peer) = match socks_listener.accept().await { Ok(v)=>v, Err(_)=>break };
-                    let sc = Arc::clone(&sc); let ad = Arc::clone(&allowed); let cfg = Arc::clone(&cfg_s); let counters = Arc::clone(&counters);
-                    tokio::spawn(async move { let _ = handle_socks5_client(stream, peer, sc, ad, cfg, None, counters).await; });
-                }
-            });
+            let task = spawn_socks_accept_loop(socks_listener, sc, allowed, cfg_s, counters);
             (socks_addr, task)
         }
         let (socks_addr, socks_task) = spawn_dual(cfg).await;
@@ -2116,19 +2109,7 @@ mod tests {
         let host=b"example.com"; let mut req=Vec::new();
         req.extend_from_slice(&[0x05,0x01,0x00,0x03, host.len() as u8]); req.extend_from_slice(host); req.extend_from_slice(&80u16.to_be_bytes());
         let _=c.write_all(&req).await;
-        let mut head=[0u8;4]; let _=c.read_exact(&mut head).await; assert_eq!(head[0], 0x05); assert_eq!(head[1], 0x00);
-        match head[3] {
-            0x01 => { let mut b=[0u8;4]; let _=c.read_exact(&mut b).await; }
-            0x04 => { let mut b=[0u8;16]; let _=c.read_exact(&mut b).await; }
-            0x03 => { let mut l=[0u8;1]; let _=c.read_exact(&mut l).await; let mut d=vec![0u8;l[0] as usize]; if l[0]>0 { let _=c.read_exact(&mut d).await; } }
-            _ => {}
-        }
-        let mut port=[0u8;2]; let _=c.read_exact(&mut port).await;
-        // HTTP over tunnel
-        let _=c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
-        let mut buf=Vec::new(); let mut tmp=[0u8;1024];
-        loop { match timeout(Duration::from_millis(800), c.read(&mut tmp)).await { Ok(Ok(0))=>break, Ok(Ok(n))=>{ buf.extend_from_slice(&tmp[..n]); if buf.windows(4).any(|w| w==b"\r\n\r\n") { break; } }, _=>break } }
-        let txt=String::from_utf8_lossy(&buf); assert!(txt.contains("200 OK"), "resp: {}", txt);
+        verify_socks_success_and_http_ok(&mut c).await;
 
         // Cleanup
         socks_task.abort(); upstream_task.abort();
