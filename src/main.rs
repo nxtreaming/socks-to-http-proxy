@@ -770,21 +770,18 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().map(|auth| auth.to_string())
 }
 
-/// Helper function to create an empty response body
 fn empty() -> BoxBody<Bytes, hyper::Error> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
 }
 
-/// Helper function to create a full response body
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
 }
 
-/// Helper function to create an error response with status code
 fn error_response(
     status: http::StatusCode,
     message: &'static str,
@@ -794,7 +791,6 @@ fn error_response(
     resp
 }
 
-/// Helper function to create a JSON response
 fn json_response(body: String) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut resp = Response::new(full(body));
     resp.headers_mut().insert(
@@ -804,7 +800,6 @@ fn json_response(body: String) -> Response<BoxBody<Bytes, hyper::Error>> {
     resp
 }
 
-/// Helper function to create a 407 Proxy Authentication Required response
 fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut response = Response::new(full(msg));
     *response.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
@@ -815,7 +810,6 @@ fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hy
     response
 }
 
-/// Helper function to compute stats file path for a specific port
 fn get_stats_path(config: &ProxyConfig, port: u16) -> PathBuf {
     match &config.stats_dir {
         Some(dir) => PathBuf::from(dir).join(format!("traffic_stats_{}.txt", port)),
@@ -863,7 +857,6 @@ fn check_proxy_auth(
     }
 }
 
-/// Helper function to check domain access
 fn check_domain_access(
     allowed_domains: &Option<HashSet<String>>,
     domain: &str,
@@ -1042,7 +1035,6 @@ async fn read_exact_timeout(
     }
 }
 
-// Helper: build a SocksConnector from config to avoid duplicate field cloning
 fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
     Arc::new(SocksConnector::new(
         cfg.socks_addr,
@@ -1053,7 +1045,6 @@ fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
     ))
 }
 
-// Helper: register per-IP connection; returns Some(count) if allowed, None if rejected
 async fn try_register_connection(client_ip: std::net::IpAddr, conn_limit: usize) -> Option<usize> {
     let ip_tracker = get_ip_tracker();
     match ip_tracker.try_increment(client_ip, conn_limit).await {
