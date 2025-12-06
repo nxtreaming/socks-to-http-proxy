@@ -1036,13 +1036,39 @@ async fn read_exact_timeout(
 }
 
 fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
-    Arc::new(SocksConnector::new(
-        cfg.socks_addr,
-        Arc::new(cfg.socks_auth.clone()),
-        Arc::new(cfg.vendor_password.clone()),
-        Arc::new(cfg.soax_settings.clone()),
-        Arc::new(cfg.connpnt_settings.clone()),
-    ))
+	use crate::socks::UpstreamProvider;
+
+	// If multi-provider config is present (and vendor modes are disabled), build weighted providers
+	let (providers, weights_pattern) = if let (Some(addr2), Some((w1, w2))) = (cfg.socks_addr2, cfg.socks_weights) {
+	    // Provider 1: primary socks_addr with optional per-provider auth1 (fallback to shared socks_auth)
+	    let auth1 = cfg
+	        .socks_auth1
+	        .clone()
+	        .or_else(|| cfg.socks_auth.clone());
+	    let auth2 = cfg.socks_auth2.clone();
+	    let mut providers = Vec::with_capacity(2);
+	    providers.push(UpstreamProvider { addr: cfg.socks_addr, auth: auth1 });
+	    providers.push(UpstreamProvider { addr: addr2, auth: auth2 });
+
+	    // Build deterministic pattern vector of provider indices according to weights
+	    let mut pattern = Vec::with_capacity((w1 + w2) as usize);
+	    pattern.extend(std::iter::repeat(0).take(w1 as usize));
+	    pattern.extend(std::iter::repeat(1).take(w2 as usize));
+
+	    (Some(providers), Some(pattern))
+	} else {
+	    (None, None)
+	};
+
+	Arc::new(SocksConnector::new(
+	    cfg.socks_addr,
+	    Arc::new(cfg.socks_auth.clone()),
+	    Arc::new(cfg.vendor_password.clone()),
+	    Arc::new(cfg.soax_settings.clone()),
+	    Arc::new(cfg.connpnt_settings.clone()),
+	    providers,
+	    weights_pattern,
+	))
 }
 
 async fn try_register_connection(client_ip: std::net::IpAddr, conn_limit: usize) -> Option<usize> {
@@ -1322,6 +1348,7 @@ fn base_proxy_config(port: u16) -> ProxyConfig {
         mode: ListenMode::Http,
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         socks_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1080)),
+	        socks_addr2: None,
         socks_listen_addr: None,
         allowed_domains: None,
         http_basic_auth: None,
@@ -1332,10 +1359,13 @@ fn base_proxy_config(port: u16) -> ProxyConfig {
         soax_settings: SoaxSettings { enabled: false, package_id: None, country: None, region: None, city: None, isp: None, sessionlength: 300, bindttl: None, idlettl: None, opts: vec![] },
         vendor_password: None,
         socks_auth: None,
+	        socks_auth1: None,
+	        socks_auth2: None,
         socks_in_auth: None,
         stats_dir: None,
         stats_interval: 60,
-        connpnt_settings: ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+	        connpnt_settings: ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
+	        socks_weights: None,
     }
 }
 

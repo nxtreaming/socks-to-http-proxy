@@ -3,6 +3,7 @@ use crate::config::{ConnpntSettings, SoaxSettings};
 use crate::session::new_session_id;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_socks::tcp::Socks5Stream;
 
 /// Error type for SOCKS5 connection operations
@@ -25,33 +26,51 @@ pub enum SocksError {
 /// Result type for SOCKS5 operations
 pub type SocksResult<T> = Result<T, SocksError>;
 
+/// Simple upstream provider description for standard SOCKS5 mode
+#[derive(Debug, Clone)]
+pub struct UpstreamProvider {
+	pub addr: SocketAddr,
+	pub auth: Option<Auth>,
+}
+
 /// SOCKS5 connection manager
 #[derive(Debug)]
 pub struct SocksConnector {
-    socks_addr: SocketAddr,
-    auth: Arc<Option<Auth>>,
-    vendor_password: Arc<Option<String>>,
-    soax_settings: Arc<SoaxSettings>,
-    connpnt_settings: Arc<ConnpntSettings>,
+	// Primary single-provider fields (also used as provider1 in multi-provider mode)
+	socks_addr: SocketAddr,
+	auth: Arc<Option<Auth>>,
+	vendor_password: Arc<Option<String>>,
+	soax_settings: Arc<SoaxSettings>,
+	connpnt_settings: Arc<ConnpntSettings>,
+
+	// Optional deterministic weighted upstream providers for standard mode
+	providers: Option<Vec<UpstreamProvider>>,
+	weights_pattern: Option<Vec<usize>>, // indices into providers
+	pattern_index: AtomicUsize,
 }
 
 impl SocksConnector {
-    /// Create a new SOCKS5 connector
-    pub fn new(
-        socks_addr: SocketAddr,
-        auth: Arc<Option<Auth>>,
-        vendor_password: Arc<Option<String>>,
-        soax_settings: Arc<SoaxSettings>,
-        connpnt_settings: Arc<ConnpntSettings>,
-    ) -> Self {
-        Self {
-            socks_addr,
-            auth,
-            vendor_password,
-            soax_settings,
-            connpnt_settings,
-        }
-    }
+	/// Create a new SOCKS5 connector (single-provider or multi-provider)
+	pub fn new(
+	    socks_addr: SocketAddr,
+	    auth: Arc<Option<Auth>>,
+	    vendor_password: Arc<Option<String>>,
+	    soax_settings: Arc<SoaxSettings>,
+	    connpnt_settings: Arc<ConnpntSettings>,
+	    providers: Option<Vec<UpstreamProvider>>,
+	    weights_pattern: Option<Vec<usize>>,
+	) -> Self {
+	    Self {
+	        socks_addr,
+	        auth,
+	        vendor_password,
+	        soax_settings,
+	        connpnt_settings,
+	        providers,
+	        weights_pattern,
+	        pattern_index: AtomicUsize::new(0),
+	    }
+	}
 
     /// Open a SOCKS5 stream to the target address
     pub async fn connect(
@@ -99,29 +118,56 @@ impl SocksConnector {
             .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
     }
 
-    /// Connect using standard SOCKS5 authentication
-    async fn connect_standard(
-        &self,
-        target_addr: &str,
-    ) -> SocksResult<Socks5Stream<tokio::net::TcpStream>> {
-        match self.auth.as_ref() {
-            Some(auth) => {
-                Socks5Stream::connect_with_password(
-                    self.socks_addr,
-                    target_addr,
-                    &auth.username,
-                    &auth.password,
-                )
-                .await
-                .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
-            }
-            None => {
-                Socks5Stream::connect(self.socks_addr, target_addr)
-                    .await
-                    .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
-            }
-        }
-    }
+	/// Deterministically select an upstream provider index based on weights_pattern
+	fn select_provider_index(&self) -> usize {
+	    if let Some(pattern) = &self.weights_pattern {
+	        if pattern.is_empty() {
+	            return 0;
+	        }
+	        let idx = self.pattern_index.fetch_add(1, Ordering::Relaxed);
+	        pattern[idx % pattern.len()]
+	    } else {
+	        0
+	    }
+	}
+
+	/// Connect using standard SOCKS5 authentication (single or multi-provider)
+	async fn connect_standard(
+	    &self,
+	    target_addr: &str,
+	) -> SocksResult<Socks5Stream<tokio::net::TcpStream>> {
+	    // Choose provider: either from multi-provider list, or fallback to primary
+	    let (addr, auth_opt) = if let Some(providers) = &self.providers {
+	        if providers.is_empty() {
+	            (self.socks_addr, self.auth.as_ref().clone())
+	        } else {
+	            let idx = self.select_provider_index();
+	            let idx = idx.min(providers.len() - 1);
+	            let p = &providers[idx];
+	            (p.addr, p.auth.clone())
+	        }
+	    } else {
+	        (self.socks_addr, self.auth.as_ref().clone())
+	    };
+
+	    match auth_opt {
+	        Some(auth) => {
+	            Socks5Stream::connect_with_password(
+	                addr,
+	                target_addr,
+	                &auth.username,
+	                &auth.password,
+	            )
+	            .await
+	            .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
+	        }
+	        None => {
+	            Socks5Stream::connect(addr, target_addr)
+	                .await
+	                .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
+	        }
+	    }
+	}
 
     /// Get the SOCKS5 server address
     #[allow(dead_code)]
@@ -281,13 +327,15 @@ impl SocksConnectorBuilder {
             socks_port: 9135,
         });
 
-        let connector = SocksConnector::new(
-            socks_addr,
-            Arc::new(self.auth),
-            Arc::new(self.vendor_password),
-            Arc::new(soax_settings),
-            Arc::new(connpnt_settings),
-        );
+	        let connector = SocksConnector::new(
+	            socks_addr,
+	            Arc::new(self.auth),
+	            Arc::new(self.vendor_password),
+	            Arc::new(soax_settings),
+	            Arc::new(connpnt_settings),
+	            None,
+	            None,
+	        );
 
         // Validate the configuration
         connector.validate()?;

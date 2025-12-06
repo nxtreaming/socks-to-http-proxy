@@ -62,6 +62,24 @@ Note (SOCKS inbound, security):
 
 ### Advanced Usage Examples
 
+#### Two upstream SOCKS5 providers with weighted ratio
+
+Use two upstream SOCKS5 providers and distribute new connections between them with a deterministic ratio (for example, 80% via `sp1`, 20% via `sp2`):
+
+```bash
+sthp -p 8080 \
+  --socks-address  sp1.example.com:1080 \
+  --socks-address2 sp2.example.com:1080 \
+  --socks1-user user1 --socks1-pass pass1 \
+  --socks2-user user2 --socks2-pass pass2 \
+  --socks-ratio 80:20
+```
+
+Notes:
+- `--socks-ratio W1:W2` controls how many connections go to each provider per cycle.
+- If `--socks1-user/--socks1-pass` is omitted, the shared `-u/--username` and `-P/--password` (if set) are used for the first provider.
+- This multi-provider mode is only available for plain SOCKS5 upstreams; it cannot be combined with SOAX or Connpnt vendor modes.
+
 - Require HTTP proxy auth and allow only example.com (apex + subdomains):
 ```bash
 sthp -p 8080 -s 127.0.0.1:1080 \
@@ -124,7 +142,13 @@ Options:
 
       --no-httpauth <1/0>                  Ignore HTTP Basic Auth [default: 1]
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
-      --socks-in-auth <USER:PASSWD>         Inbound SOCKS5 auth for local SOCKS server
+      --socks-address2 <SOCKS_ADDRESS>     Optional second upstream SOCKS5 proxy (for weighted multi-provider mode)
+      --socks-ratio <W1:W2>                Weights for two upstream providers (e.g. 80:20)
+      --socks1-user <USERNAME>             Per-provider username for first upstream (overrides -u when set)
+      --socks1-pass <PASSWORD>             Per-provider password for first upstream
+      --socks2-user <USERNAME>             Per-provider username for second upstream
+      --socks2-pass <PASSWORD>             Per-provider password for second upstream
+      --socks-in-auth <USER:PASSWD>        Inbound SOCKS5 auth for local SOCKS server
 
       --allowed-domains <ALLOWED_DOMAINS>  Comma-separated list of allowed domains (supports exact, *.domain, .domain, or *)
       --idle-timeout <IDLE_TIMEOUT>        Idle timeout in seconds for CONNECT tunnels and regular HTTP requests [default: 540]

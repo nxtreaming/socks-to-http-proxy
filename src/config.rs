@@ -56,13 +56,34 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     pub listen_ip: Ipv4Addr,
 
-    /// SOCKS5 authentication credentials for upstream server
-    #[command(flatten)]
-    pub auth: Option<Auths>,
+	/// SOCKS5 authentication credentials for upstream server (single-provider mode)
+	#[command(flatten)]
+	pub auth: Option<Auths>,
 
-    /// Upstream SOCKS5 proxy address or hostname:port
-    #[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
-    pub socks_address: String,
+	/// Upstream SOCKS5 proxy address or hostname:port (single-provider mode)
+	#[arg(short, long, default_value = "127.0.0.1:1080", value_name = "HOST:PORT")]
+	pub socks_address: String,
+
+	/// Optional second upstream SOCKS5 proxy address (multi-provider mode)
+	/// When set together with --socks-address, enables two-provider weighted routing.
+	#[arg(long = "socks-address2", value_name = "HOST:PORT")]
+	pub socks_address2: Option<String>,
+
+	/// SOCKS5 auth for first upstream provider in multi-provider mode
+	#[arg(long = "socks1-user")]
+	pub socks1_user: Option<String>,
+	#[arg(long = "socks1-pass")]
+	pub socks1_pass: Option<String>,
+
+	/// SOCKS5 auth for second upstream provider in multi-provider mode
+	#[arg(long = "socks2-user")]
+	pub socks2_user: Option<String>,
+	#[arg(long = "socks2-pass")]
+	pub socks2_pass: Option<String>,
+
+	/// Weights for upstream providers in multi-provider mode, as "W1:W2" (e.g. 80:20)
+	#[arg(long = "socks-ratio", value_name = "W1:W2")] 
+	pub socks_ratio: Option<String>,
 
     /// Inbound SOCKS5 auth for socks mode (format: user:pass)
     #[arg(long = "socks-in-auth")]
@@ -339,6 +360,8 @@ pub struct ProxyConfig {
     pub mode: ListenMode,
     pub listen_addr: std::net::SocketAddr,
     pub socks_addr: std::net::SocketAddr,
+	    /// Optional second upstream SOCKS5 server (multi-provider mode)
+	    pub socks_addr2: Option<std::net::SocketAddr>,
     pub socks_listen_addr: Option<std::net::SocketAddr>,
 
     pub allowed_domains: Option<HashSet<String>>,
@@ -350,27 +373,50 @@ pub struct ProxyConfig {
     pub soax_settings: SoaxSettings,
     pub vendor_password: Option<String>,
     pub socks_auth: Option<crate::auth::Auth>,
+	    /// Optional per-provider auth for multi-provider mode
+	    pub socks_auth1: Option<crate::auth::Auth>,
+	    pub socks_auth2: Option<crate::auth::Auth>,
     pub socks_in_auth: Option<crate::auth::Auth>,
     pub stats_dir: Option<String>,
     pub stats_interval: u64,
     pub connpnt_settings: ConnpntSettings,
+	    /// Optional weights for two-provider mode (w1, w2)
+	    pub socks_weights: Option<(u32, u32)>,
 }
 
 impl ProxyConfig {
-    /// Create ProxyConfig from CLI arguments
-    pub async fn from_cli(args: Cli) -> color_eyre::Result<Self> {
+	    /// Create ProxyConfig from CLI arguments
+	    pub async fn from_cli(args: Cli) -> color_eyre::Result<Self> {
         use base64::engine::general_purpose;
         use base64::Engine;
         use hyper::header::HeaderValue;
 
-        // Resolve default SOCKS5 address (used in Standard/SOAX modes)
-        let socks_addr = match tokio::net::lookup_host(&args.socks_address).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(addr) => addr,
-                None => return Err(color_eyre::eyre::eyre!("No addresses found for {}", args.socks_address)),
-            },
-            Err(e) => return Err(color_eyre::eyre::eyre!("Failed to resolve {}: {}", args.socks_address, e)),
-        };
+	        // Resolve primary SOCKS5 address (used in Standard/SOAX modes and as provider1 in multi-provider)
+	        let socks_addr = match tokio::net::lookup_host(&args.socks_address).await {
+	            Ok(mut addrs) => match addrs.next() {
+	                Some(addr) => addr,
+	                None => return Err(color_eyre::eyre::eyre!("No addresses found for {}", args.socks_address)),
+	            },
+	            Err(e) => return Err(color_eyre::eyre::eyre!("Failed to resolve {}: {}", args.socks_address, e)),
+	        };
+
+	        // Optional secondary SOCKS5 address for two-provider mode
+	        let socks_addr2 = if let Some(addr2) = &args.socks_address2 {
+	            let mut addrs = tokio::net::lookup_host(addr2).await.map_err(|e| {
+	                color_eyre::eyre::eyre!("Failed to resolve {}: {}", addr2, e)
+	            })?;
+	            match addrs.next() {
+	                Some(a) => Some(a),
+	                None => {
+	                    return Err(color_eyre::eyre::eyre!(
+	                        "No addresses found for secondary SOCKS address {}",
+	                        addr2
+	                    ))
+	                }
+	            }
+	        } else {
+	            None
+	        };
 
         // Create HTTP listen address (supports --http-port override)
         let http_port = args.http_port.unwrap_or(args.port);
@@ -388,13 +434,22 @@ impl ProxyConfig {
                 .collect()
         });
 
-        // Extract vendor password (-P) and SOCKS auth separately
-        let vendor_password = args.auth.as_ref().and_then(|a| a.password.clone());
-        let socks_auth = args.auth.as_ref()
-            .and_then(|a| match (&a.username, &a.password) {
-                (Some(u), Some(p)) => Some(crate::auth::Auth::new(u.clone(), p.clone())),
-                _ => None,
-            });
+	        // Extract vendor password (-P) and SOCKS auth (single-provider)
+	        let vendor_password = args.auth.as_ref().and_then(|a| a.password.clone());
+	        let socks_auth = args.auth.as_ref().and_then(|a| match (&a.username, &a.password) {
+	            (Some(u), Some(p)) => Some(crate::auth::Auth::new(u.clone(), p.clone())),
+	            _ => None,
+	        });
+
+	        // Multi-provider per-upstream auth (takes precedence over shared socks_auth when used)
+	        let socks_auth1 = match (&args.socks1_user, &args.socks1_pass) {
+	            (Some(u), Some(p)) => Some(crate::auth::Auth::new(u.clone(), p.clone())),
+	            _ => None,
+	        };
+	        let socks_auth2 = match (&args.socks2_user, &args.socks2_pass) {
+	            (Some(u), Some(p)) => Some(crate::auth::Auth::new(u.clone(), p.clone())),
+	            _ => None,
+	        };
 
         // Create HTTP Basic Auth header
         let http_basic_auth = args
@@ -405,7 +460,7 @@ impl ProxyConfig {
             .transpose()
             .map_err(|_| color_eyre::eyre::eyre!("Invalid HTTP Basic auth string"))?;
 
-        // Provider settings
+	        // Provider settings
         let soax_settings = SoaxSettings::from_cli(&args);
         let connpnt_settings = ConnpntSettings::from_cli(&args);
 
@@ -413,10 +468,57 @@ impl ProxyConfig {
         if soax_settings.enabled && connpnt_settings.enabled {
             return Err(color_eyre::eyre::eyre!("SOAX and Connpnt modes cannot both be enabled"));
         }
-        soax_settings.validate(&vendor_password)
-            .map_err(|e| color_eyre::eyre::eyre!(e))?;
-        connpnt_settings.validate(&vendor_password)
-            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+	        soax_settings
+	            .validate(&vendor_password)
+	            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+	        connpnt_settings
+	            .validate(&vendor_password)
+	            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+
+	        // Parse optional two-provider weights from socks_ratio ("W1:W2")
+	        let socks_weights = if let Some(ratio) = &args.socks_ratio {
+	            let parts: Vec<&str> = ratio.split(':').collect();
+	            if parts.len() != 2 {
+	                return Err(color_eyre::eyre::eyre!(
+	                    "Invalid --socks-ratio format, expected W1:W2, got {}",
+	                    ratio
+	                ));
+	            }
+	            let w1: u32 = parts[0].parse().map_err(|_| {
+	                color_eyre::eyre::eyre!("Invalid first weight in --socks-ratio: {}", parts[0])
+	            })?;
+	            let w2: u32 = parts[1].parse().map_err(|_| {
+	                color_eyre::eyre::eyre!("Invalid second weight in --socks-ratio: {}", parts[1])
+	            })?;
+	            if w1 == 0 || w2 == 0 {
+	                return Err(color_eyre::eyre::eyre!(
+	                    "Both weights in --socks-ratio must be positive (got {}:{})",
+	                    w1, w2
+	                ));
+	            }
+	            Some((w1, w2))
+	        } else {
+	            None
+	        };
+
+	        // Basic validation for multi-provider vs vendor modes
+	        if socks_addr2.is_some() || socks_weights.is_some() || socks_auth1.is_some() || socks_auth2.is_some() {
+	            if soax_settings.enabled || connpnt_settings.enabled {
+	                return Err(color_eyre::eyre::eyre!(
+	                    "Multi-provider SOCKS cannot be combined with SOAX or Connpnt vendor modes"
+	                ));
+	            }
+	            if socks_addr2.is_none() {
+	                return Err(color_eyre::eyre::eyre!(
+	                    "Multi-provider mode requires --socks-address2 and --socks-ratio"
+	                ));
+	            }
+	            if socks_weights.is_none() {
+	                return Err(color_eyre::eyre::eyre!(
+	                    "Multi-provider mode requires --socks-ratio when --socks-address2 is set"
+	                ));
+	            }
+	        }
 
         // Inbound SOCKS5 auth (socks mode)
         let socks_in_auth = match args.socks_in_auth.as_ref() {
@@ -432,11 +534,12 @@ impl ProxyConfig {
             None => None,
         };
 
-        Ok(Self {
+	        Ok(Self {
             mode: args.mode,
             listen_addr,
             socks_listen_addr,
             socks_addr,
+	            socks_addr2,
             allowed_domains,
             http_basic_auth,
             no_httpauth: args.no_httpauth == 1,
@@ -446,10 +549,13 @@ impl ProxyConfig {
             soax_settings,
             vendor_password,
             socks_auth,
+	            socks_auth1,
+	            socks_auth2,
             socks_in_auth,
             stats_dir: args.stats_dir.clone(),
             stats_interval: args.stats_interval,
-            connpnt_settings,
+	            connpnt_settings,
+	            socks_weights,
         })
     }
 }
