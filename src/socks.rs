@@ -131,6 +131,44 @@ impl SocksConnector {
         }
     }
 
+    /// For two-provider mode, emulate Connpnt vendor behaviour when the upstream
+    /// username is already a fully-expanded Connpnt string, e.g.:
+    ///   base-ipstr-keeptime-country-N
+    /// We randomize the second `ipstr` segment per connection to restore the
+    /// "new IP per request" semantics.
+    fn maybe_randomize_connpnt_username(username: &str) -> Option<String> {
+        let parts: Vec<&str> = username.split('-').collect();
+        if parts.len() != 5 {
+            return None;
+        }
+        // Expected pattern: base-ipstr-keeptime-country-N
+        if parts[4] != "N" {
+            return None;
+        }
+        // Connpnt usernames typically start with "u" and keeptime is numeric.
+        if !parts[0].starts_with('u') {
+            return None;
+        }
+        if parts[2].parse::<u32>().is_err() {
+            return None;
+        }
+
+        let raw_ipstr = parts[1];
+        let sid = new_session_id();
+        let rand8 = &sid[..8.min(sid.len())];
+        // Preserve any project prefix before '$', if present.
+        let new_ipstr = if let Some((project, _)) = raw_ipstr.split_once('$') {
+            format!("{}${}", project, rand8)
+        } else {
+            rand8.to_string()
+        };
+
+        Some(format!(
+            "{}-{}-{}-{}-{}",
+            parts[0], new_ipstr, parts[2], parts[3], parts[4]
+        ))
+    }
+
     /// Connect using standard SOCKS5 authentication (single or multi-provider)
     async fn connect_standard(
         &self,
@@ -151,7 +189,18 @@ impl SocksConnector {
         };
 
         match auth_opt {
-            Some(auth) => {
+            Some(mut auth) => {
+                // In two-provider mode, restore Connpnt vendor semantics for
+                // fully-expanded usernames by randomizing the second segment
+                // (ipstr) on each connection.
+                if self.providers.is_some() {
+                    if let Some(new_username) =
+                        Self::maybe_randomize_connpnt_username(&auth.username)
+                    {
+                        auth.username = new_username;
+                    }
+                }
+
                 Socks5Stream::connect_with_password(
                     addr,
                     target_addr,
