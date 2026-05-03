@@ -62,6 +62,7 @@ impl BufferPool {
     }
 
     /// Return a buffer to the pool for reuse
+    #[allow(dead_code)]
     pub async fn return_buffer(&self, mut buffer: Vec<u8>, large: bool) {
         let expected_size = Self::buffer_size(large);
 
@@ -83,6 +84,31 @@ impl BufferPool {
 
         if pool.len() < MAX_POOL_SIZE {
             pool.push(buffer);
+        }
+    }
+
+    /// Best-effort synchronous return for Drop paths. If the pool lock is busy,
+    /// dropping the buffer is cheaper and safer than spawning unbounded cleanup tasks.
+    fn try_return_buffer(&self, mut buffer: Vec<u8>, large: bool) {
+        let expected_size = Self::buffer_size(large);
+
+        if buffer.capacity() < expected_size || buffer.capacity() > expected_size * 2 {
+            return;
+        }
+
+        buffer.clear();
+        buffer.resize(expected_size, 0);
+
+        let pool = if large {
+            &self.large_buffers
+        } else {
+            &self.small_buffers
+        };
+
+        if let Ok(mut pool) = pool.try_lock() {
+            if pool.len() < MAX_POOL_SIZE {
+                pool.push(buffer);
+            }
         }
     }
 
@@ -141,6 +167,7 @@ pub async fn get_buffer(large: bool) -> Vec<u8> {
 }
 
 /// Convenience function to return a buffer to the global pool
+#[allow(dead_code)]
 pub async fn return_buffer(buffer: Vec<u8>, large: bool) {
     get_buffer_pool().return_buffer(buffer, large).await;
 }
@@ -178,13 +205,7 @@ impl BufferLease {
 impl Drop for BufferLease {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let large = self.large;
-            // Return the buffer asynchronously without blocking drop
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    return_buffer(buffer, large).await;
-                });
-            }
+            get_buffer_pool().try_return_buffer(buffer, self.large);
         }
     }
 }

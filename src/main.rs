@@ -34,7 +34,7 @@ use tracing_subscriber::EnvFilter;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal;
 
 use bytes::Bytes;
@@ -50,6 +50,8 @@ use hyper_util::rt::TokioIo;
 use pin_project::{pin_project, pinned_drop};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
@@ -138,14 +140,15 @@ where
         let this = self.project();
         match this.inner.poll_frame(cx) {
             Poll::Ready(None) => {
-                // Response body has finished streaming. Allow the upstream
-                // connection driver to complete gracefully before releasing
-                // the connection guard to avoid abrupt aborts.
-                if let (Some(guard), Some(handle)) = (this.connection_guard.take(), this.driver_handle.take()) {
-                    tokio::spawn(async move {
-                        let _ = handle.await; // ignore join errors; connection likely closed
-                        drop(guard);
-                    });
+                // The body is complete; stop the upstream driver now so it cannot
+                // linger on keep-alive and hold the connection slot indefinitely.
+                if let (Some(guard), Some(handle)) =
+                    (this.connection_guard.take(), this.driver_handle.take())
+                {
+                    if !handle.is_finished() {
+                        handle.abort();
+                    }
+                    drop(guard);
                 }
                 Poll::Ready(None)
             }
@@ -651,12 +654,15 @@ async fn proxy(
             dir: CountDir::Rx,
         });
 
-        let socks_stream = match socks_connector
-            .connect(addr.as_str(), sessionid.as_deref())
-            .await
+        let connect_timeout = bounded_connect_timeout(config.idle_timeout);
+        let socks_stream = match tokio::time::timeout(
+            connect_timeout,
+            socks_connector.connect(addr.as_str(), sessionid.as_deref()),
+        )
+        .await
         {
-            Ok(stream) => stream,
-            Err(e) => {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
                 if let Some(guard) = connection_guard.take() {
                     drop(guard);
                 }
@@ -664,6 +670,19 @@ async fn proxy(
                 return Ok(error_response(
                     http::StatusCode::BAD_GATEWAY,
                     "SOCKS5 connection failed",
+                ));
+            }
+            Err(_) => {
+                if let Some(guard) = connection_guard.take() {
+                    drop(guard);
+                }
+                warn!(
+                    "Upstream SOCKS5 connection #{} timed out after {:?}",
+                    conn_id, connect_timeout
+                );
+                return Ok(error_response(
+                    http::StatusCode::GATEWAY_TIMEOUT,
+                    "SOCKS5 connection timeout",
                 ));
             }
         };
@@ -901,16 +920,25 @@ async fn tunnel(
     };
     let conn_id = ConnectionGuard::active_count();
 
-    let socks_stream = match socks_connector
-        .connect(addr.as_str(), sessionid.as_deref())
-        .await
+    let connect_timeout = bounded_connect_timeout(idle_timeout);
+    let socks_stream = match tokio::time::timeout(
+        connect_timeout,
+        socks_connector.connect(addr.as_str(), sessionid.as_deref()),
+    )
+    .await
     {
-        Ok(stream) => stream,
-        Err(e) => {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
             // Connection guard will be automatically dropped here, decrementing the counter
             return Err(color_eyre::eyre::eyre!(
                 "Upstream SOCKS5 connection failed: {}",
                 e
+            ));
+        }
+        Err(_) => {
+            return Err(color_eyre::eyre::eyre!(
+                "Upstream SOCKS5 connection timed out after {:?}",
+                connect_timeout
             ));
         }
     };
@@ -940,7 +968,14 @@ async fn tunnel(
                         break;
                     }
                     Ok(n) => {
-                        if let Err(e) = server.write_all(&client_lease.as_mut_slice()[..n]).await {
+                        if let Err(e) = write_all_timeout(
+                            &mut server,
+                            &client_lease.as_mut_slice()[..n],
+                            timeout,
+                            "tunnel server write",
+                        )
+                        .await
+                        {
                             warn!("Tunnel #{} server write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
@@ -962,7 +997,14 @@ async fn tunnel(
                         break;
                     }
                     Ok(n) => {
-                        if let Err(e) = client.write_all(&server_lease.as_mut_slice()[..n]).await {
+                        if let Err(e) = write_all_timeout(
+                            &mut client,
+                            &server_lease.as_mut_slice()[..n],
+                            timeout,
+                            "tunnel client write",
+                        )
+                        .await
+                        {
                             warn!("Tunnel #{} client write error: {}", conn_id, e);
                             error = Some(e.into());
                             break;
@@ -988,13 +1030,13 @@ async fn tunnel(
     traffic_counters.add_rx(from_client);
     traffic_counters.add_tx(from_server);
 
-    if let Err(e) = server.shutdown().await {
+    if let Err(e) = shutdown_timeout(&mut server, timeout, "server shutdown").await {
         // Only log unexpected shutdown errors
         if !e.to_string().contains("connection closed") && !e.to_string().contains("broken pipe") {
             warn!("Server shutdown error: {}", e);
         }
     }
-    if let Err(e) = client.shutdown().await {
+    if let Err(e) = shutdown_timeout(&mut client, timeout, "client shutdown").await {
         // Only log unexpected shutdown errors
         if !e.to_string().contains("connection closed") && !e.to_string().contains("broken pipe") {
             warn!("Client shutdown error: {}", e);
@@ -1032,6 +1074,45 @@ async fn read_exact_timeout(
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake read timeout")),
+    }
+}
+
+fn bounded_connect_timeout(idle_timeout: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(idle_timeout.clamp(1, UPSTREAM_CONNECT_TIMEOUT_SECS))
+}
+
+async fn write_all_timeout<W>(
+    writer: &mut W,
+    buf: &[u8],
+    dur: std::time::Duration,
+    operation: &'static str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::time::timeout(dur, writer.write_all(buf)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{operation} timeout"),
+        )),
+    }
+}
+
+async fn shutdown_timeout<W>(
+    writer: &mut W,
+    dur: std::time::Duration,
+    operation: &'static str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::time::timeout(dur, writer.shutdown()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{operation} timeout"),
+        )),
     }
 }
 
@@ -1263,13 +1344,28 @@ async fn handle_socks5_client(
     }
 
     // 4) Connect upstream via SOCKS5
-    let mut server = match socks_connector.connect(dest_host_port.as_str(), sessionid.as_deref()).await {
-        Ok(s) => s,
-        Err(e) => {
+    let connect_timeout = bounded_connect_timeout(config.idle_timeout);
+    let mut server = match tokio::time::timeout(
+        connect_timeout,
+        socks_connector.connect(dest_host_port.as_str(), sessionid.as_deref()),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             let _ = client
                 .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) // general failure
                 .await;
             return Err(color_eyre::eyre::eyre!("Upstream SOCKS connect failed: {}", e));
+        }
+        Err(_) => {
+            let _ = client
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(color_eyre::eyre::eyre!(
+                "Upstream SOCKS connect timed out after {:?}",
+                connect_timeout
+            ));
         }
     };
 
@@ -1303,26 +1399,48 @@ async fn handle_socks5_client(
                 match res {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Err(e) = server.write_all(&client_lease.as_mut_slice()[..n]).await {
-                            warn!("SOCKS tunnel server write error: {}", e); break;
+                        if let Err(e) = write_all_timeout(
+                            &mut server,
+                            &client_lease.as_mut_slice()[..n],
+                            timeout,
+                            "SOCKS tunnel server write",
+                        )
+                        .await
+                        {
+                            warn!("SOCKS tunnel server write error: {}", e);
+                            break;
                         }
                         from_client += n as u64;
                         idle.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
-                    Err(e) => { warn!("SOCKS tunnel client read error: {}", e); break; }
+                    Err(e) => {
+                        warn!("SOCKS tunnel client read error: {}", e);
+                        break;
+                    }
                 }
             }
             res = server.read(server_lease.as_mut_slice()) => {
                 match res {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Err(e) = client.write_all(&server_lease.as_mut_slice()[..n]).await {
-                            warn!("SOCKS tunnel client write error: {}", e); break;
+                        if let Err(e) = write_all_timeout(
+                            &mut client,
+                            &server_lease.as_mut_slice()[..n],
+                            timeout,
+                            "SOCKS tunnel client write",
+                        )
+                        .await
+                        {
+                            warn!("SOCKS tunnel client write error: {}", e);
+                            break;
                         }
                         from_server += n as u64;
                         idle.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
-                    Err(e) => { warn!("SOCKS tunnel server read error: {}", e); break; }
+                    Err(e) => {
+                        warn!("SOCKS tunnel server read error: {}", e);
+                        break;
+                    }
                 }
             }
             _ = &mut idle => {
@@ -1335,8 +1453,8 @@ async fn handle_socks5_client(
     traffic_counters.add_rx(from_client);
     traffic_counters.add_tx(from_server);
 
-    let _ = server.shutdown().await;
-    let _ = client.shutdown().await;
+    let _ = shutdown_timeout(&mut server, timeout, "SOCKS server shutdown").await;
+    let _ = shutdown_timeout(&mut client, timeout, "SOCKS client shutdown").await;
     Ok(())
 }
 
@@ -1634,6 +1752,22 @@ mod tests {
         }
 
         tokio::task::yield_now().await;
+
+        assert_eq!(ConnectionGuard::active_count(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guarded_body_end_stream_releases_guard_without_waiting_for_driver() {
+        ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+
+        let guard = ConnectionGuard::try_new().expect("expected guard to be acquired");
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let mut body = GuardedBody::new(Empty::<Bytes>::new(), guard, handle);
+        assert!(body.frame().await.is_none());
 
         assert_eq!(ConnectionGuard::active_count(), 0);
     }
