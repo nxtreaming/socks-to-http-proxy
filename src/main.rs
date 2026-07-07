@@ -52,6 +52,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
+const CONNECT_UPGRADE_TIMEOUT_SECS: u64 = 10;
 
 // Body wrapper that counts data bytes passing through
 #[derive(Debug, Clone, Copy)]
@@ -559,7 +560,6 @@ async fn proxy(
 
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
-            let socks_connector = socks_connector.clone();
             // HTTPS (CONNECT) domain filtering based on allowed_domains
             // For CONNECT, the request URI is authority-form (host:port). Use authority().host().
             if let Some(authority) = req.uri().authority() {
@@ -569,24 +569,72 @@ async fn proxy(
                 }
             }
 
+            let connection_guard = match ConnectionGuard::try_new() {
+                Some(guard) => guard,
+                None => {
+                    let current_connections = ConnectionGuard::active_count();
+                    warn!(
+                        "Tunnel connection limit reached: {} (max: {})",
+                        current_connections, MAX_CONCURRENT_CONNECTIONS
+                    );
+                    return Ok(error_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Server overloaded, please try again later",
+                    ));
+                }
+            };
+
             let idle_timeout = config.idle_timeout;
+            let connect_timeout = bounded_connect_timeout(idle_timeout);
+            let socks_stream = match tokio::time::timeout(
+                connect_timeout,
+                socks_connector.connect(addr.as_str(), sessionid.as_deref()),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    drop(connection_guard);
+                    warn!("Upstream SOCKS5 tunnel connection failed: {}", e);
+                    return Ok(error_response(
+                        http::StatusCode::BAD_GATEWAY,
+                        "Upstream connection failed",
+                    ));
+                }
+                Err(_) => {
+                    drop(connection_guard);
+                    warn!(
+                        "Upstream SOCKS5 tunnel connection timed out after {:?}",
+                        connect_timeout
+                    );
+                    return Ok(error_response(
+                        http::StatusCode::GATEWAY_TIMEOUT,
+                        "Upstream connection timeout",
+                    ));
+                }
+            };
+
+            let upgrade_timeout = std::time::Duration::from_secs(CONNECT_UPGRADE_TIMEOUT_SECS);
             tokio::task::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
+                match tokio::time::timeout(upgrade_timeout, hyper::upgrade::on(req)).await {
+                    Ok(Ok(upgraded)) => {
                         if let Err(e) = tunnel(
                             upgraded,
-                            addr,
-                            socks_connector,
+                            socks_stream,
                             idle_timeout,
-                            sessionid.clone(),
                             Arc::clone(&traffic_counters),
+                            connection_guard,
                         )
                         .await
                         {
                             warn!("server io error: {}", e);
                         };
                     }
-                    Err(e) => warn!("upgrade error: {}", e),
+                    Ok(Err(e)) => warn!("upgrade error: {}", e),
+                    Err(_) => warn!(
+                        "CONNECT upgrade timed out after {:?}; closing tunnel resources",
+                        upgrade_timeout
+                    ),
                 }
             });
 
@@ -669,7 +717,7 @@ async fn proxy(
                 warn!("Upstream SOCKS5 connection #{} failed: {}", conn_id, e);
                 return Ok(error_response(
                     http::StatusCode::BAD_GATEWAY,
-                    "SOCKS5 connection failed",
+                    "Upstream connection failed",
                 ));
             }
             Err(_) => {
@@ -682,7 +730,7 @@ async fn proxy(
                 );
                 return Ok(error_response(
                     http::StatusCode::GATEWAY_TIMEOUT,
-                    "SOCKS5 connection timeout",
+                    "Upstream connection timeout",
                 ));
             }
         };
@@ -897,54 +945,14 @@ fn check_domain_access(
 
 async fn tunnel(
     upgraded: Upgraded,
-    addr: String,
-    socks_connector: Arc<SocksConnector>,
+    mut server: tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>,
     idle_timeout: u64,
-    sessionid: Option<String>,
     traffic_counters: Arc<TrafficCounters>,
+    _connection_guard: ConnectionGuard,
 ) -> Result<()> {
-    let _connection_guard = match ConnectionGuard::try_new() {
-        Some(guard) => guard,
-        None => {
-            let current_connections = ConnectionGuard::active_count();
-            warn!(
-                "Tunnel connection limit reached: {} (max: {})",
-                current_connections, MAX_CONCURRENT_CONNECTIONS
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "Server overloaded",
-            )
-            .into());
-        }
-    };
     let conn_id = ConnectionGuard::active_count();
 
-    let connect_timeout = bounded_connect_timeout(idle_timeout);
-    let socks_stream = match tokio::time::timeout(
-        connect_timeout,
-        socks_connector.connect(addr.as_str(), sessionid.as_deref()),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            // Connection guard will be automatically dropped here, decrementing the counter
-            return Err(color_eyre::eyre::eyre!(
-                "Upstream SOCKS5 connection failed: {}",
-                e
-            ));
-        }
-        Err(_) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Upstream SOCKS5 connection timed out after {:?}",
-                connect_timeout
-            ));
-        }
-    };
-
     let mut client = TokioIo::new(upgraded);
-    let mut server = socks_stream;
 
     // Idle-aware bidirectional copy with immediate connection close detection
     let timeout = tokio::time::Duration::from_secs(idle_timeout);
@@ -2142,6 +2150,125 @@ mod tests {
         drop(sender);
         let _ = client_task.await;
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connect_returns_bad_gateway_when_upstream_socks_fails() {
+        use hyper::Request;
+
+        let port = 18087u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        let unused_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused upstream port");
+        let unused_upstream = unused_listener
+            .local_addr()
+            .expect("unused upstream local addr");
+        drop(unused_listener);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.socks_addr = unused_upstream;
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("example.com:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send CONNECT");
+        assert_eq!(resp.status(), http::StatusCode::BAD_GATEWAY);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        assert_eq!(body_bytes, Bytes::from_static(b"Upstream connection failed"));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connect_returns_service_unavailable_when_connection_limit_reached() {
+        use hyper::Request;
+
+        struct ActiveCounterReset;
+        impl Drop for ActiveCounterReset {
+            fn drop(&mut self) {
+                ACTIVE_SOCKS5_CONNECTIONS.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let port = 18088u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        ACTIVE_SOCKS5_CONNECTIONS.store(MAX_CONCURRENT_CONNECTIONS, Ordering::Relaxed);
+        let _reset = ActiveCounterReset;
+
+        let cfg = base_proxy_config(port);
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("example.com:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("send CONNECT");
+        assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connect_returns_gateway_timeout_when_upstream_socks_hangs() {
+        use hyper::Request;
+
+        let port = 18089u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+
+        let hanging_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging upstream socks");
+        let hanging_upstream = hanging_listener
+            .local_addr()
+            .expect("hanging upstream local addr");
+        let hanging_task = tokio::spawn(async move {
+            if let Ok((_stream, _peer)) = hanging_listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let mut cfg = base_proxy_config(port);
+        cfg.socks_addr = hanging_upstream;
+        cfg.idle_timeout = 1;
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("example.com:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send CONNECT");
+        assert_eq!(resp.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        assert_eq!(body_bytes, Bytes::from_static(b"Upstream connection timeout"));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+        hanging_task.abort();
     }
 
     #[tokio::test]
