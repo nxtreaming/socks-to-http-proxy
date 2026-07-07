@@ -2,6 +2,7 @@
 
 ## 0.9.8
 
+- Serialize per-port traffic stats persistence so periodic saves and `POST /stats/reset` cannot race on the same temporary stats file or overwrite reset results out of order.
 - Extra SOCKS listener bind failures are now fatal when `--socks-port` is explicitly configured, preventing the process from continuing in a half-ready HTTP-only state.
 - Normalize non-CONNECT HTTP forwarding: only `http://...` absolute-form requests are accepted, `https://...` requests are rejected with 400 and should use CONNECT, accepted HTTP request targets are rewritten to origin-form before forwarding upstream, and Host is preserved or synthesized from the original authority when absent.
 - Validate `--allowed-domains` entries at startup using the existing domain pattern validator. Patterns are now trimmed and lowercased before storage, and invalid or empty entries fail fast instead of silently never matching.

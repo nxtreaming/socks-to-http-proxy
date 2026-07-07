@@ -300,6 +300,7 @@ Recommendations:
 
 - Per-port cumulative byte counters (RX from client, TX to client)
 - Persistence: one file per listening port: `traffic_stats_{port}.txt` in `--stats-dir` (default: current directory)
+- Persistence writes for the same port are serialized, so periodic saves and `POST /stats/reset` cannot race on the same stats file.
 - Periodic logging and persistence every `--stats-interval` seconds (default: 60)
 - Management endpoints (apply the same HTTP auth policy as the proxy itself):
   - `GET /stats` → `{"port":<u16>,"rx":<u64>,"tx":<u64>}`

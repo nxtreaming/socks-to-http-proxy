@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Per-listener traffic counters (bytes)
 #[derive(Debug, Default)]
@@ -42,9 +42,22 @@ impl TrafficCounters {
 /// Global registry of traffic counters keyed by listening port
 static TRAFFIC_REGISTRY: std::sync::OnceLock<RwLock<HashMap<u16, Arc<TrafficCounters>>>> =
     std::sync::OnceLock::new();
+static TRAFFIC_SAVE_LOCKS: std::sync::OnceLock<RwLock<HashMap<u16, Arc<Mutex<()>>>>> =
+    std::sync::OnceLock::new();
 
 fn registry() -> &'static RwLock<HashMap<u16, Arc<TrafficCounters>>> {
     TRAFFIC_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn save_locks() -> &'static RwLock<HashMap<u16, Arc<Mutex<()>>>> {
+    TRAFFIC_SAVE_LOCKS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+async fn save_lock_for_port(port: u16) -> Arc<Mutex<()>> {
+    let mut map = save_locks().write().await;
+    map.entry(port)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Get or create counters for a given listening port
@@ -121,6 +134,8 @@ pub async fn load_from_file(path: &Path) -> io::Result<()> {
 
 /// Save a single port's counters to a file: one line "port\trx\ttx"
 pub async fn save_port_to_file(port: u16, path: &Path) -> io::Result<()> {
+    let save_lock = save_lock_for_port(port).await;
+    let _save_guard = save_lock.lock().await;
     let (rx, tx) = snapshot(port).await.unwrap_or((0, 0));
     if let Some(dir) = path.parent() {
         tfs::create_dir_all(dir).await?;
@@ -152,4 +167,45 @@ pub async fn save_to_file(path: &Path) -> io::Result<()> {
     drop(f);
     tfs::rename(tmp, path).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_stats_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join("sthp_traffic_tests")
+            .join(format!("{}_{}_{}.txt", name, std::process::id(), nanos))
+    }
+
+    #[tokio::test]
+    async fn concurrent_save_port_to_file_calls_do_not_conflict() {
+        let port = 39123u16;
+        let path = unique_stats_path("concurrent_save_port");
+        let counters = get_counters_for_port(port).await;
+        counters.set(123, 456);
+
+        let mut tasks = Vec::new();
+        for _ in 0..200 {
+            let path = path.clone();
+            tasks.push(tokio::spawn(async move { save_port_to_file(port, &path).await }));
+        }
+
+        for task in tasks {
+            task.await.expect("save task should not panic").expect("save should not fail");
+        }
+
+        let contents = tfs::read_to_string(&path).await.expect("read saved stats");
+        assert_eq!(contents, format!("{}\t123\t456\n", port));
+
+        if let Some(dir) = path.parent() {
+            let _ = tfs::remove_dir_all(dir).await;
+        }
+    }
 }
