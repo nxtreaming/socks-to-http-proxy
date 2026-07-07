@@ -2,4 +2,5 @@
 
 ## 0.9.8
 
+- Validate `--allowed-domains` entries at startup using the existing domain pattern validator. Patterns are now trimmed and lowercased before storage, and invalid or empty entries fail fast instead of silently never matching.
 - Security/behavior change: `--http-basic user:pass` now enables HTTP proxy authentication by default. In earlier versions, credentials were accepted but authentication stayed disabled unless `--no-httpauth=0` was also provided. Existing deployments that intentionally keep HTTP auth disabled while passing credentials must now set `--no-httpauth=1` explicitly.

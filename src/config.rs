@@ -1,3 +1,4 @@
+use crate::domain::validate_domain_pattern;
 use clap::{value_parser, Args, Parser};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -444,12 +445,25 @@ impl ProxyConfig {
             .socks_port
             .map(|p| std::net::SocketAddr::from((args.listen_ip, p)));
 
-        // Convert allowed domains to HashSet
-        let allowed_domains = args.allowed_domains.clone().map(|v| {
-            v.into_iter()
-                .map(|pattern| pattern.to_ascii_lowercase())
-                .collect()
-        });
+        // Convert allowed domains to normalized, validated patterns.
+        let allowed_domains = match args.allowed_domains.clone() {
+            Some(patterns) => {
+                let mut normalized = HashSet::new();
+                for raw_pattern in patterns {
+                    let pattern = raw_pattern.trim().to_ascii_lowercase();
+                    validate_domain_pattern(&pattern).map_err(|err| {
+                        color_eyre::eyre::eyre!(
+                            "Invalid --allowed-domains pattern {:?}: {}",
+                            raw_pattern,
+                            err
+                        )
+                    })?;
+                    normalized.insert(pattern);
+                }
+                Some(normalized)
+            }
+            None => None,
+        };
 
         // Extract vendor password (-P) and SOCKS auth (single-provider)
         let vendor_password = args.auth.as_ref().and_then(|a| a.password.clone());
@@ -610,6 +624,7 @@ impl ProxyConfig {
 mod tests {
     use super::{Cli, ProxyConfig, SoaxSettings};
     use clap::Parser;
+    use std::collections::HashSet;
 
     fn base_settings() -> SoaxSettings {
         SoaxSettings {
@@ -706,6 +721,54 @@ sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
             .expect_err("zero idle timeout should be rejected by config builder");
         assert!(
             err.to_string().contains("idle-timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_domains_are_trimmed_and_lowercased() {
+        let args = Cli::try_parse_from([
+            "sthp",
+            "--allowed-domains",
+            " Example.COM, *.Test.ORG ",
+        ])
+        .expect("parse cli");
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+
+        assert_eq!(
+            config.allowed_domains,
+            Some(HashSet::from([
+                "example.com".to_string(),
+                "*.test.org".to_string(),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_domains_reject_invalid_patterns() {
+        let args = Cli::try_parse_from(["sthp", "--allowed-domains", "example..com"])
+            .expect("parse cli");
+
+        let err = ProxyConfig::from_cli(args)
+            .await
+            .expect_err("invalid domain pattern should be rejected");
+        assert!(
+            err.to_string().contains("--allowed-domains"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_domains_reject_empty_patterns_after_trimming() {
+        let args = Cli::try_parse_from(["sthp", "--allowed-domains", "example.com, "])
+            .expect("parse cli");
+
+        let err = ProxyConfig::from_cli(args)
+            .await
+            .expect_err("empty domain pattern should be rejected");
+        assert!(
+            err.to_string().contains("--allowed-domains"),
             "unexpected error: {err}"
         );
     }

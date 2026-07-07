@@ -256,6 +256,8 @@ Use `--allowed-domains` with a comma-separated list. Supported patterns:
 - `.example.com` — apex and any subdomain (example.com, a.example.com)
 - `*` — allow all domains
 
+Patterns are trimmed and lowercased at startup. Invalid patterns and empty comma-separated entries are rejected immediately.
+
 
 Note: The whitelist is applied to both normal HTTP requests and CONNECT tunnels. Matching is based on the request Host only.
 
