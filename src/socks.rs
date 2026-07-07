@@ -2,8 +2,8 @@ use crate::auth::Auth;
 use crate::config::{ConnpntSettings, SoaxSettings};
 use crate::session::new_session_id;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_socks::tcp::Socks5Stream;
 
 /// Error type for SOCKS5 connection operations
@@ -45,8 +45,8 @@ pub struct SocksConnector {
 
     // Optional deterministic weighted upstream providers for standard mode
     providers: Option<Vec<UpstreamProvider>>,
-    weights_pattern: Option<Vec<usize>>, // indices into providers
-    pattern_index: AtomicUsize,
+    provider_weights: Option<(u32, u32)>,
+    pattern_index: AtomicU64,
 }
 
 impl SocksConnector {
@@ -58,7 +58,7 @@ impl SocksConnector {
         soax_settings: Arc<SoaxSettings>,
         connpnt_settings: Arc<ConnpntSettings>,
         providers: Option<Vec<UpstreamProvider>>,
-        weights_pattern: Option<Vec<usize>>,
+        provider_weights: Option<(u32, u32)>,
     ) -> Self {
         Self {
             socks_addr,
@@ -67,8 +67,8 @@ impl SocksConnector {
             soax_settings,
             connpnt_settings,
             providers,
-            weights_pattern,
-            pattern_index: AtomicUsize::new(0),
+            provider_weights,
+            pattern_index: AtomicU64::new(0),
         }
     }
 
@@ -118,14 +118,19 @@ impl SocksConnector {
             .map_err(|e| SocksError::ConnectionFailed(e.to_string()))
     }
 
-    /// Deterministically select an upstream provider index based on weights_pattern
+    /// Deterministically select an upstream provider index based on configured weights.
     fn select_provider_index(&self) -> usize {
-        if let Some(pattern) = &self.weights_pattern {
-            if pattern.is_empty() {
+        if let Some((w1, w2)) = self.provider_weights {
+            let total = u64::from(w1) + u64::from(w2);
+            if total == 0 {
                 return 0;
             }
-            let idx = self.pattern_index.fetch_add(1, Ordering::Relaxed);
-            pattern[idx % pattern.len()]
+            let idx = self.pattern_index.fetch_add(1, Ordering::Relaxed) % total;
+            if idx < u64::from(w1) {
+                0
+            } else {
+                1
+            }
         } else {
             0
         }

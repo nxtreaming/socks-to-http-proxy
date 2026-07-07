@@ -569,19 +569,9 @@ async fn proxy(
                 }
             }
 
-            let connection_guard = match ConnectionGuard::try_new() {
-                Some(guard) => guard,
-                None => {
-                    let current_connections = ConnectionGuard::active_count();
-                    warn!(
-                        "Tunnel connection limit reached: {} (max: {})",
-                        current_connections, MAX_CONCURRENT_CONNECTIONS
-                    );
-                    return Ok(error_response(
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Server overloaded, please try again later",
-                    ));
-                }
+            let connection_guard = match try_acquire_tunnel_guard() {
+                Ok(guard) => guard,
+                Err(resp) => return Ok(*resp),
             };
 
             let idle_timeout = config.idle_timeout;
@@ -943,6 +933,23 @@ fn check_domain_access(
     Ok(())
 }
 
+fn try_acquire_tunnel_guard() -> Result<ConnectionGuard, Box<Response<BoxBody<Bytes, hyper::Error>>>> {
+    match ConnectionGuard::try_new() {
+        Some(guard) => Ok(guard),
+        None => {
+            let current_connections = ConnectionGuard::active_count();
+            warn!(
+                "Tunnel connection limit reached: {} (max: {})",
+                current_connections, MAX_CONCURRENT_CONNECTIONS
+            );
+            Err(Box::new(error_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "Server overloaded, please try again later",
+            )))
+        }
+    }
+}
+
 async fn tunnel(
     upgraded: Upgraded,
     mut server: tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>,
@@ -1128,23 +1135,19 @@ fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
     use crate::socks::UpstreamProvider;
 
     // If multi-provider config is present (and vendor modes are disabled), build weighted providers
-    let (providers, weights_pattern) = if let (Some(addr2), Some((w1, w2))) = (cfg.socks_addr2, cfg.socks_weights) {
+    let (providers, provider_weights) = if let (Some(addr2), Some((w1, w2))) = (cfg.socks_addr2, cfg.socks_weights) {
         // Provider 1: primary socks_addr with optional per-provider auth1 (fallback to shared socks_auth)
         let auth1 = cfg
             .socks_auth1
             .clone()
             .or_else(|| cfg.socks_auth.clone());
         let auth2 = cfg.socks_auth2.clone();
-        let mut providers = Vec::with_capacity(2);
-        providers.push(UpstreamProvider { addr: cfg.socks_addr, auth: auth1 });
-        providers.push(UpstreamProvider { addr: addr2, auth: auth2 });
+        let providers = vec![
+            UpstreamProvider { addr: cfg.socks_addr, auth: auth1 },
+            UpstreamProvider { addr: addr2, auth: auth2 },
+        ];
 
-        // Build deterministic pattern vector of provider indices according to weights
-        let mut pattern = Vec::with_capacity((w1 + w2) as usize);
-        pattern.extend(std::iter::repeat(0).take(w1 as usize));
-        pattern.extend(std::iter::repeat(1).take(w2 as usize));
-
-        (Some(providers), Some(pattern))
+        (Some(providers), Some((w1, w2)))
     } else {
         (None, None)
     };
@@ -1156,7 +1159,7 @@ fn build_socks_connector(cfg: &ProxyConfig) -> Arc<SocksConnector> {
         Arc::new(cfg.soax_settings.clone()),
         Arc::new(cfg.connpnt_settings.clone()),
         providers,
-        weights_pattern,
+        provider_weights,
     ))
 }
 
@@ -2190,11 +2193,9 @@ mod tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn connect_returns_service_unavailable_when_connection_limit_reached() {
-        use hyper::Request;
-
+    fn connect_returns_service_unavailable_when_connection_limit_reached() {
         struct ActiveCounterReset;
         impl Drop for ActiveCounterReset {
             fn drop(&mut self) {
@@ -2202,29 +2203,14 @@ mod tests {
             }
         }
 
-        let port = 18088u16;
-        reset_port(port).await;
-        let counters = get_counters_for_port(port).await;
-
         ACTIVE_SOCKS5_CONNECTIONS.store(MAX_CONCURRENT_CONNECTIONS, Ordering::Relaxed);
         let _reset = ActiveCounterReset;
 
-        let cfg = base_proxy_config(port);
-        let config = Arc::new(cfg);
-        let (mut sender, client_task, server) =
-            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
-
-        let req = Request::builder()
-            .method("CONNECT")
-            .uri("example.com:443")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let resp = sender.send_request(req).await.expect("send CONNECT");
+        let resp = match try_acquire_tunnel_guard() {
+            Ok(_) => panic!("tunnel guard should not be acquired at the connection limit"),
+            Err(resp) => resp,
+        };
         assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-
-        drop(sender);
-        let _ = client_task.await;
-        let _ = server.await;
     }
 
     #[tokio::test]

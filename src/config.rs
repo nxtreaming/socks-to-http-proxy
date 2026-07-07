@@ -4,6 +4,17 @@ use std::net::Ipv4Addr;
 
 use clap::ValueEnum;
 
+const MAX_NORMALIZED_SOCKS_RATIO_TOTAL: u32 = 10_000;
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 /// Listen mode for the proxy server
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ListenMode {
@@ -496,7 +507,17 @@ impl ProxyConfig {
                     w1, w2
                 ));
             }
-            Some((w1, w2))
+            let divisor = gcd_u32(w1, w2);
+            let normalized = (w1 / divisor, w2 / divisor);
+            let normalized_total = u64::from(normalized.0) + u64::from(normalized.1);
+            if normalized_total > u64::from(MAX_NORMALIZED_SOCKS_RATIO_TOTAL) {
+                return Err(color_eyre::eyre::eyre!(
+                    "The normalized total for --socks-ratio is too large ({} > {}). Use smaller weights or a reducible ratio.",
+                    normalized_total,
+                    MAX_NORMALIZED_SOCKS_RATIO_TOTAL
+                ));
+            }
+            Some(normalized)
         } else {
             None
         };
@@ -562,7 +583,8 @@ impl ProxyConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::SoaxSettings;
+    use super::{Cli, ProxyConfig, SoaxSettings};
+    use clap::Parser;
 
     fn base_settings() -> SoaxSettings {
         SoaxSettings {
@@ -600,6 +622,41 @@ mod tests {
             username,
             "package-pkg123-country-US-region-CA-city-LosAngeles-isp-ATT-opt-uniqip-opt-lookalike-\
 sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
+        );
+    }
+
+    #[tokio::test]
+    async fn socks_ratio_is_normalized_before_storage() {
+        let args = Cli::try_parse_from([
+            "sthp",
+            "--socks-address2",
+            "127.0.0.1:1081",
+            "--socks-ratio",
+            "1000000000:1000000000",
+        ])
+        .expect("parse cli");
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+        assert_eq!(config.socks_weights, Some((1, 1)));
+    }
+
+    #[tokio::test]
+    async fn socks_ratio_rejects_large_normalized_total() {
+        let args = Cli::try_parse_from([
+            "sthp",
+            "--socks-address2",
+            "127.0.0.1:1081",
+            "--socks-ratio",
+            "10001:10000",
+        ])
+        .expect("parse cli");
+
+        let err = ProxyConfig::from_cli(args)
+            .await
+            .expect_err("oversized normalized ratio should be rejected");
+        assert!(
+            err.to_string().contains("normalized total"),
+            "unexpected error: {err}"
         );
     }
 }
