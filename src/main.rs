@@ -272,14 +272,9 @@ async fn main() -> Result<()> {
     let socks_connector = build_socks_connector(config.as_ref());
 
     let listener = TcpListener::bind(config.listen_addr).await?;
-    // Optional extra SOCKS listener bound if configured
-    let mut extra_socks_listener: Option<TcpListener> = None;
-    if let Some(addr) = socks_extra_listener {
-        match TcpListener::bind(addr).await {
-            Ok(l) => extra_socks_listener = Some(l),
-            Err(e) => warn!("Failed to bind extra SOCKS listener on {}: {}", addr, e),
-        }
-    }
+    // Optional extra SOCKS listener bound if explicitly configured. Binding
+    // failures are fatal so the service cannot run in a surprising half-ready state.
+    let extra_socks_listener = bind_extra_socks_listener(socks_extra_listener).await?;
 
     // Add a simplified connection monitoring task
     tokio::task::spawn(async move {
@@ -905,6 +900,17 @@ async fn proxy(
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
     uri.authority().map(|auth| auth.to_string())
+}
+
+async fn bind_extra_socks_listener(
+    addr: Option<std::net::SocketAddr>,
+) -> Result<Option<TcpListener>> {
+    match addr {
+        Some(addr) => TcpListener::bind(addr).await.map(Some).map_err(|e| {
+            color_eyre::eyre::eyre!("Failed to bind extra SOCKS listener on {}: {}", addr, e)
+        }),
+        None => Ok(None),
+    }
 }
 
 fn empty() -> BoxBody<Bytes, hyper::Error> {
@@ -1754,6 +1760,23 @@ mod tests {
                 });
             }
         })
+    }
+
+    #[tokio::test]
+    async fn extra_socks_listener_bind_conflict_returns_error() {
+        let occupied_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied extra socks port");
+        let occupied_addr = occupied_listener.local_addr().expect("occupied listener addr");
+
+        let err = bind_extra_socks_listener(Some(occupied_addr))
+            .await
+            .expect_err("explicit extra SOCKS listener bind conflict should fail startup");
+
+        assert!(
+            err.to_string().contains("extra SOCKS listener"),
+            "unexpected error: {err}"
+        );
     }
 
     async fn spawn_fake_socks_upstream() -> (std::net::SocketAddr, JoinHandle<()>) {

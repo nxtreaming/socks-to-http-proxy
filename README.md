@@ -33,6 +33,8 @@ See "Advanced Usage Examples" below for authentication and domain whitelist conf
 
 Run HTTP and SOCKS5 listeners at the same time (different ports):
 
+If the explicitly configured SOCKS listener cannot bind, startup fails instead of continuing with only the HTTP listener.
+
 ```bash
 sthp --http-port 8080 --socks-port 1081 -s 127.0.0.1:1080
 # HTTP client
