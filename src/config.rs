@@ -181,7 +181,7 @@ pub struct Cli {
     pub no_httpauth: u8,
 
     /// Idle timeout in seconds for tunnel connections
-    #[arg(long, default_value_t = 540)]
+    #[arg(long, value_parser = value_parser!(u64).range(1..), default_value_t = 540)]
     pub idle_timeout: u64,
 
     /// Maximum connections per IP address
@@ -401,6 +401,12 @@ impl ProxyConfig {
         use base64::engine::general_purpose;
         use base64::Engine;
         use hyper::header::HeaderValue;
+
+        if args.idle_timeout == 0 {
+            return Err(color_eyre::eyre::eyre!(
+                "--idle-timeout must be at least 1 second"
+            ));
+        }
 
         // Resolve primary SOCKS5 address (used in Standard/SOAX modes and as provider1 in multi-provider)
         let socks_addr = match tokio::net::lookup_host(&args.socks_address).await {
@@ -656,6 +662,31 @@ sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
             .expect_err("oversized normalized ratio should be rejected");
         assert!(
             err.to_string().contains("normalized total"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_zero_is_rejected_by_cli() {
+        let err = Cli::try_parse_from(["sthp", "--idle-timeout", "0"])
+            .expect_err("zero idle timeout should be rejected by CLI parser");
+        assert!(
+            err.to_string().contains("invalid value")
+                || err.to_string().contains("not in"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_zero_is_rejected_by_config_builder() {
+        let mut args = Cli::try_parse_from(["sthp"]).expect("parse cli");
+        args.idle_timeout = 0;
+
+        let err = ProxyConfig::from_cli(args)
+            .await
+            .expect_err("zero idle timeout should be rejected by config builder");
+        assert!(
+            err.to_string().contains("idle-timeout"),
             "unexpected error: {err}"
         );
     }
