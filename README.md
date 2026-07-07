@@ -83,14 +83,14 @@ Notes:
 - Require HTTP proxy auth and allow only example.com (apex + subdomains):
 ```bash
 sthp -p 8080 -s 127.0.0.1:1080 \
-  --http-basic user:pass --no-httpauth=0 \
+  --http-basic user:pass \
   --allowed-domains .example.com
 ```
 
 - Allow multiple domains (exact apex and subdomains):
 ```bash
 sthp -p 8080 -s 127.0.0.1:1080 \
-  --http-basic user:pass --no-httpauth=0 \
+  --http-basic user:pass \
   --allowed-domains example.com,*.test.org
 ```
 
@@ -106,7 +106,7 @@ sthp -p 8080 -s 127.0.0.1:1080 --conn-per-ip 300
 - Auth + whitelist + per-IP limit:
 ```bash
 sthp -p 8080 -s 127.0.0.1:1080 \
-  --http-basic user:pass --no-httpauth=0 \
+  --http-basic user:pass \
   --allowed-domains .example.com \
   --conn-per-ip 300
 ```
@@ -118,7 +118,7 @@ sthp -p 8080 -s 127.0.0.1:1080 --force-close=false --conn-per-ip 300
 ```bash
 sthp -p 8080 -s 127.0.0.1:1080 \
   --force-close=false \
-  --http-basic user:pass --no-httpauth=0 \
+  --http-basic user:pass \
   --allowed-domains .example.com \
   --conn-per-ip 300
 ```
@@ -140,7 +140,7 @@ Options:
       --http-port <PORT>                    HTTP listen port (overrides -p/--port)
       --socks-port <PORT>                   Additional SOCKS5 listener port (enables dual listeners)
 
-      --no-httpauth <1/0>                  Ignore HTTP Basic Auth [default: 1]
+      --no-httpauth <1/0>                  Override HTTP auth enforcement: 1 disables, 0 requires
   -s, --socks-address <SOCKS_ADDRESS>      Socks5 proxy address [default: 127.0.0.1:1080]
       --socks-address2 <SOCKS_ADDRESS>     Optional second upstream SOCKS5 proxy (for weighted multi-provider mode)
       --socks-ratio <W1:W2>                Weights for two upstream providers (e.g. 80:20)
@@ -229,15 +229,16 @@ sthp -p 8080 -s 127.0.0.1:1080 --force-close=false
 ## HTTP Proxy Authentication
 
 - Configure credentials with `--http-basic <USER:PASSWD>`.
-- Control whether authentication is enforced with `--no-httpauth <1/0>` (default: `1`, meaning HTTP auth is ignored/disabled). Set to `0` to require authentication.
-- Behavior when authentication is required (`--no-httpauth=0`):
+- Providing `--http-basic` enables HTTP proxy authentication by default. Use `--no-httpauth=1` only when you intentionally want to configure credentials but leave enforcement disabled.
+- Control whether authentication is enforced explicitly with `--no-httpauth <1/0>`: `1` disables auth, `0` requires auth.
+- Behavior when authentication is required:
   - Missing or incorrect `Proxy-Authorization` header results in `407 Proxy Authentication Required` and includes `Proxy-Authenticate: Basic realm="proxy"`.
 
 ### Examples
 
 - Require authentication:
 ```bash
-sthp -p 8080 -s 127.0.0.1:1080 --http-basic user:pass --no-httpauth=0
+sthp -p 8080 -s 127.0.0.1:1080 --http-basic user:pass
 ```
 
 - Client usage with curl:
@@ -432,4 +433,3 @@ RUST_LOG=sthp=info sthp -p 8080 -s 127.0.0.1:1080 > proxy.log 2>&1
     - Windows PowerShell: `$env:RUST_LOG="sthp=debug"; sthp -p 8080 -s 127.0.0.1:1080`
   - Lower overhead alternative: `sthp=info`
   - Save to file: `RUST_LOG=sthp=info sthp -p 8080 -s 127.0.0.1:1080 > proxy.log 2>&1`
-

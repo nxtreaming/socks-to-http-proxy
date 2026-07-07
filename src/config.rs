@@ -176,9 +176,9 @@ pub struct Cli {
     #[arg(long)]
     pub http_basic: Option<String>,
 
-    /// Disable HTTP authentication: 1 or 0 (HTTP mode only)
-    #[arg(long, value_parser = value_parser!(u8).range(0..=1), default_value_t = 1)]
-    pub no_httpauth: u8,
+    /// Disable HTTP authentication: 1 disables, 0 requires; omitted auto-enables when --http-basic is set
+    #[arg(long, value_parser = value_parser!(u8).range(0..=1))]
+    pub no_httpauth: Option<u8>,
 
     /// Idle timeout in seconds for tunnel connections
     #[arg(long, value_parser = value_parser!(u64).range(1..), default_value_t = 540)]
@@ -469,13 +469,32 @@ impl ProxyConfig {
         };
 
         // Create HTTP Basic Auth header
-        let http_basic_auth = args
-            .http_basic
-            .clone()
-            .map(|hb| format!("Basic {}", general_purpose::STANDARD.encode(hb)))
-            .map(|auth_str| HeaderValue::from_str(&auth_str))
-            .transpose()
-            .map_err(|_| color_eyre::eyre::eyre!("Invalid HTTP Basic auth string"))?;
+        let http_basic_auth = match args.http_basic.as_deref() {
+            Some(credentials) => {
+                let mut parts = credentials.splitn(2, ':');
+                let username = parts.next().unwrap_or("");
+                let password = parts.next().unwrap_or("");
+                if username.is_empty() || password.is_empty() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Invalid --http-basic, expected non-empty user:pass"
+                    ));
+                }
+
+                let auth_str = format!("Basic {}", general_purpose::STANDARD.encode(credentials));
+                Some(
+                    HeaderValue::from_str(&auth_str)
+                        .map_err(|_| color_eyre::eyre::eyre!("Invalid HTTP Basic auth string"))?,
+                )
+            }
+            None => None,
+        };
+
+        let no_httpauth = match args.no_httpauth {
+            Some(1) => true,
+            Some(0) => false,
+            Some(_) => false,
+            None => http_basic_auth.is_none(),
+        };
 
         // Provider settings
         let soax_settings = SoaxSettings::from_cli(&args);
@@ -569,7 +588,7 @@ impl ProxyConfig {
             socks_addr2,
             allowed_domains,
             http_basic_auth,
-            no_httpauth: args.no_httpauth == 1,
+            no_httpauth,
             idle_timeout: args.idle_timeout,
             conn_per_ip: args.conn_per_ip,
             force_close: args.force_close,
@@ -689,5 +708,59 @@ sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
             err.to_string().contains("idle-timeout"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn http_basic_enables_http_auth_by_default() {
+        let args = Cli::try_parse_from(["sthp", "--http-basic", "user:pass"]).expect("parse cli");
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+
+        assert!(
+            !config.no_httpauth,
+            "--http-basic should require proxy auth unless --no-httpauth=1 is explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_no_httpauth_can_disable_http_basic_auth() {
+        let args = Cli::try_parse_from(["sthp", "--http-basic", "user:pass", "--no-httpauth", "1"])
+            .expect("parse cli");
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+
+        assert!(
+            config.no_httpauth,
+            "--no-httpauth=1 should explicitly disable HTTP auth even when credentials exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_programmatic_no_httpauth_value_does_not_panic_or_disable_auth() {
+        let mut args =
+            Cli::try_parse_from(["sthp", "--http-basic", "user:pass"]).expect("parse cli");
+        args.no_httpauth = Some(5);
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+
+        assert!(
+            !config.no_httpauth,
+            "invalid programmatic --no-httpauth values should fall back to requiring auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_basic_requires_non_empty_user_and_password() {
+        for value in ["user", ":pass", "user:"] {
+            let args = Cli::try_parse_from(["sthp", "--http-basic", value]).expect("parse cli");
+
+            let err = ProxyConfig::from_cli(args)
+                .await
+                .expect_err("invalid http-basic credentials should be rejected");
+            assert!(
+                err.to_string().contains("--http-basic"),
+                "unexpected error for {value:?}: {err}"
+            );
+        }
     }
 }
