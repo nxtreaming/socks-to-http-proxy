@@ -1299,8 +1299,7 @@ async fn handle_socks5_client(
     let atyp = req_hdr[3];
 
     // destination address
-    let mut domain_opt: Option<String> = None;
-    let dest_host_port = match atyp {
+    let (dest_host_port, dest_access_host) = match atyp {
         0x01 => {
             // IPv4
             let mut ip = [0u8; 4];
@@ -1309,7 +1308,8 @@ async fn handle_socks5_client(
             read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let host = std::net::Ipv4Addr::from(ip);
-            format!("{}:{}", host, port)
+            let host = host.to_string();
+            (format!("{}:{}", host, port), host)
         }
         0x03 => {
             // Domain
@@ -1322,8 +1322,7 @@ async fn handle_socks5_client(
             read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let domain = String::from_utf8_lossy(&dom).to_string();
-            domain_opt = Some(domain.clone());
-            format!("{}:{}", domain, port)
+            (format!("{}:{}", domain, port), domain)
         }
         0x04 => {
             // IPv6
@@ -1333,7 +1332,8 @@ async fn handle_socks5_client(
             read_exact_timeout(&mut client, &mut portb, hs_timeout).await?;
             let port = u16::from_be_bytes(portb);
             let host = std::net::Ipv6Addr::from(ip);
-            format!("[{}]:{}", host, port)
+            let host = host.to_string();
+            (format!("[{}]:{}", host, port), host)
         }
         _ => {
             let _ = client
@@ -1343,13 +1343,13 @@ async fn handle_socks5_client(
         }
     };
 
-    // Domain allowlist check (if applicable)
-    if let (Some(allowed), Some(domain)) = (allowed_domains.as_ref(), domain_opt.as_ref()) {
-        if !is_domain_allowed(allowed, domain) {
+    // Destination allowlist check (if applicable)
+    if let Some(allowed) = allowed_domains.as_ref() {
+        if !is_domain_allowed(allowed, &dest_access_host) {
             let _ = client
                 .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;
-            warn!("Access to domain {} is not allowed (SOCKS mode)", domain);
+            warn!("Access to target {} is not allowed (SOCKS mode)", dest_access_host);
             return Ok(());
         }
     }
@@ -2331,6 +2331,58 @@ mod tests {
 
         // Cleanup
         http_task.abort(); socks_task.abort(); upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn socks_domain_whitelist_blocks_ipv4_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (upstream_addr, upstream_task) = spawn_fake_socks_upstream().await;
+
+        let mut allowed_set = HashSet::new();
+        allowed_set.insert(".example.com".to_string());
+
+        let mut cfg = base_proxy_config(0);
+        cfg.socks_addr = upstream_addr;
+        cfg.allowed_domains = Some(allowed_set);
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind socks listener");
+        let socks_addr = socks_listener.local_addr().expect("socks listener addr");
+        let counters = get_counters_for_port(socks_addr.port()).await;
+        let cfg = Arc::new(ProxyConfig {
+            listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            socks_listen_addr: Some(socks_addr),
+            ..cfg
+        });
+        let socks_connector = build_socks_connector(cfg.as_ref());
+        let allowed = Arc::new(cfg.allowed_domains.clone());
+        let socks_task = spawn_socks_accept_loop(socks_listener, socks_connector, allowed, cfg, counters);
+
+        let mut c = tokio::net::TcpStream::connect(socks_addr)
+            .await
+            .expect("connect socks");
+        c.write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("write greeting");
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.expect("read method selection");
+        assert_eq!(sel, [0x05, 0x00]);
+
+        let mut req = Vec::with_capacity(10);
+        req.extend_from_slice(&[0x05, 0x01, 0x00, 0x01]);
+        req.extend_from_slice(&[93, 184, 216, 34]);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.expect("write ipv4 connect");
+
+        let mut reply = [0u8; 10];
+        c.read_exact(&mut reply).await.expect("read socks reply");
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x02);
+
+        socks_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
