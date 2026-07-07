@@ -2091,8 +2091,8 @@ mod tests {
         use hyper::Request;
         use http_body_util::BodyExt;
 
-        let http_port = 18089u16;
-        let socks_port = 18090u16;
+        let http_port = 18099u16;
+        let socks_port = 18100u16;
         reset_port(http_port).await;
         reset_port(socks_port).await;
 
@@ -2140,6 +2140,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn authenticated_request_strips_proxy_headers() {
         use hyper::Request;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2281,6 +2282,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn non_connect_absolute_http_uri_is_forwarded_as_origin_form() {
         use hyper::Request;
 
@@ -2320,6 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn non_connect_absolute_http_uri_without_host_header_synthesizes_host() {
         use tokio::io::AsyncWriteExt;
 
@@ -2389,6 +2392,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn domain_whitelist_allows_non_connect_then_fails_upstream() {
         use hyper::Request;
         use std::collections::HashSet;
@@ -2452,6 +2456,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn domain_whitelist_allows_connect_then_fails_upstream() {
         use hyper::Request;
         use std::collections::HashSet;
@@ -2582,6 +2587,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn dual_listeners_end_to_end() {
         use hyper::client::conn::http1::Builder as ClientBuilder;
         use hyper_util::rt::TokioIo;
@@ -2654,10 +2660,16 @@ mod tests {
         let _ = tokio::join!(http_fut, socks_fut);
 
         // Cleanup
-        http_task.abort(); socks_task.abort(); upstream_task.abort();
+        http_task.abort();
+        socks_task.abort();
+        upstream_task.abort();
+        let _ = http_task.await;
+        let _ = socks_task.await;
+        let _ = upstream_task.await;
     }
 
     #[tokio::test]
+    #[serial]
     async fn socks_domain_whitelist_blocks_ipv4_target() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2707,9 +2719,12 @@ mod tests {
 
         socks_task.abort();
         upstream_task.abort();
+        let _ = socks_task.await;
+        let _ = upstream_task.await;
     }
 
     #[tokio::test]
+    #[serial]
     async fn socks_inbound_auth_end_to_end() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use crate::auth::Auth;
@@ -2756,6 +2771,9 @@ mod tests {
         verify_socks_success_and_http_ok(&mut c).await;
 
         // Cleanup
-        socks_task.abort(); upstream_task.abort();
+        socks_task.abort();
+        upstream_task.abort();
+        let _ = socks_task.await;
+        let _ = upstream_task.await;
     }
 }
