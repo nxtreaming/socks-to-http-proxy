@@ -40,7 +40,7 @@ use tokio::signal;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::Builder;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, CONNECTION};
+use hyper::header::{HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
@@ -551,13 +551,6 @@ async fn proxy(
         return Ok(json_response(body));
     }
 
-    // Check domain access for non-CONNECT requests
-    if let Some(request_domain) = req.uri().host() {
-        if let Err(resp) = check_domain_access(allowed_domains.as_ref(), request_domain) {
-            return Ok(*resp);
-        }
-    }
-
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
             // HTTPS (CONNECT) domain filtering based on allowed_domains
@@ -637,6 +630,34 @@ async fn proxy(
             ))
         }
     } else {
+        match req.uri().scheme_str() {
+            Some("http") => {}
+            Some("https") => {
+                warn!(
+                    "Non-CONNECT HTTPS request received; clients must use CONNECT: {:?}",
+                    req.uri()
+                );
+                return Ok(error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "HTTPS requests must use CONNECT",
+                ));
+            }
+            Some(_) => {
+                warn!("Unsupported HTTP proxy request scheme: {:?}", req.uri());
+                return Ok(error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "Only http:// request URIs are supported",
+                ));
+            }
+            None => {
+                warn!("HTTP request missing scheme: {:?}", req.uri());
+                return Ok(error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "HTTP request must use absolute-form http:// URI",
+                ));
+            }
+        }
+
         let host = match req.uri().host() {
             Some(h) => h,
             None => {
@@ -647,8 +668,67 @@ async fn proxy(
                 ));
             }
         };
+        if let Err(resp) = check_domain_access(allowed_domains.as_ref(), host) {
+            return Ok(*resp);
+        }
         let port = req.uri().port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
+        let authority = req
+            .uri()
+            .authority()
+            .map(|authority| authority.as_str().to_string());
+        let origin_form = req
+            .uri()
+            .path_and_query()
+            .map(|path_and_query| path_and_query.as_str())
+            .unwrap_or("/");
+        let origin_uri = match origin_form.parse::<http::Uri>() {
+            Ok(uri) => uri,
+            Err(e) => {
+                warn!(
+                    "Failed to normalize HTTP request target {:?} to origin-form {:?}: {}",
+                    req.uri(),
+                    origin_form,
+                    e
+                );
+                return Ok(error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "Invalid HTTP request target",
+                ));
+            }
+        };
+        let mut req = req;
+        if !req.headers().contains_key(HOST) {
+            let authority = match authority {
+                Some(authority) => authority,
+                None => {
+                    warn!(
+                        "HTTP request missing authority while synthesizing Host: {:?}",
+                        req.uri()
+                    );
+                    return Ok(error_response(
+                        http::StatusCode::BAD_REQUEST,
+                        "HTTP request missing host",
+                    ));
+                }
+            };
+            let host_header = match HeaderValue::from_str(&authority) {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!(
+                        "Invalid authority {:?} while synthesizing Host header: {}",
+                        authority,
+                        e
+                    );
+                    return Ok(error_response(
+                        http::StatusCode::BAD_REQUEST,
+                        "Invalid HTTP Host",
+                    ));
+                }
+            };
+            req.headers_mut().insert(HOST, host_header);
+        }
+        *req.uri_mut() = origin_uri;
 
         let mut connection_guard = match ConnectionGuard::try_new() {
             Some(guard) => Some(guard),
@@ -1587,10 +1667,10 @@ mod tests {
 
     // Test helpers to reduce duplicated fragments (available to all tests below)
     // Read from stream until CRLFCRLF or timeout between reads; returns accumulated bytes
-    async fn read_until_header_end(
-        stream: &mut tokio::net::TcpStream,
-        step_timeout: Duration,
-    ) -> Vec<u8> {
+    async fn read_until_header_end<R>(stream: &mut R, step_timeout: Duration) -> Vec<u8>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -1607,6 +1687,51 @@ mod tests {
             }
         }
         buf
+    }
+
+    async fn spawn_raw_in_memory_proxy(
+        config: Arc<ProxyConfig>,
+        counters: Arc<TrafficCounters>,
+    ) -> (tokio::io::DuplexStream, JoinHandle<()>) {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let socks = Arc::new(
+            socks::SocksConnectorBuilder::new()
+                .socks_addr(config.socks_addr)
+                .build()
+                .expect("builder should succeed"),
+        );
+        let http_basic = Arc::new(config.http_basic_auth.clone());
+        let allowed = Arc::new(config.allowed_domains.clone());
+        let counters_arc = counters.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+
+        let server = tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                proxy(
+                    req,
+                    Arc::clone(&socks),
+                    Arc::clone(&http_basic),
+                    Arc::clone(&allowed),
+                    Arc::clone(&config),
+                    None,
+                    Arc::clone(&counters_arc),
+                )
+            });
+            if let Err(e) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                panic!("server error: {}", e);
+            }
+        });
+
+        (client_io, server)
     }
 
     // Spawn a SOCKS accept loop that forwards clients to handle_socks5_client
@@ -1657,6 +1782,72 @@ mod tests {
             }
         });
         (addr, task)
+    }
+
+    async fn spawn_capturing_socks_upstream() -> (
+        std::net::SocketAddr,
+        Arc<Mutex<Vec<u8>>>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capturing upstream socks");
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_task = Arc::clone(&captured);
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream socks client");
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.expect("read greeting header");
+            let mut methods = vec![0u8; greeting[1] as usize];
+            if !methods.is_empty() {
+                stream.read_exact(&mut methods).await.expect("read auth methods");
+            }
+            stream
+                .write_all(&[0x05, 0x00])
+                .await
+                .expect("write method selection");
+
+            let mut request_header = [0u8; 4];
+            stream.read_exact(&mut request_header).await.expect("read request header");
+            match request_header[3] {
+                0x01 => {
+                    let mut addr = [0u8; 4];
+                    stream.read_exact(&mut addr).await.expect("read ipv4 address");
+                }
+                0x03 => {
+                    let mut len_buf = [0u8; 1];
+                    stream.read_exact(&mut len_buf).await.expect("read domain length");
+                    let mut domain = vec![0u8; len_buf[0] as usize];
+                    if !domain.is_empty() {
+                        stream.read_exact(&mut domain).await.expect("read domain name");
+                    }
+                }
+                0x04 => {
+                    let mut addr = [0u8; 16];
+                    stream.read_exact(&mut addr).await.expect("read ipv6 address");
+                }
+                _ => {}
+            }
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await.expect("read port");
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .expect("write connect reply");
+
+            let request = read_until_header_end(&mut stream, Duration::from_secs(1)).await;
+            *captured_task.lock().await = request;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write http response");
+            stream.shutdown().await.expect("shutdown upstream socks stream");
+        });
+        (addr, captured, task)
     }
 
     async fn verify_socks_success_and_http_ok(c: &mut tokio::net::TcpStream) {
@@ -1798,7 +1989,8 @@ mod tests {
         let mut cfg = base_proxy_config(port);
         cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test").to_string_lossy().to_string());
         let config = Arc::new(cfg);
-        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
 
         // GET /stats should return current counters
         let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
@@ -1841,7 +2033,8 @@ mod tests {
         cfg.stats_dir = Some(std::env::temp_dir().join("sthp_test").to_string_lossy().to_string());
         let config = Arc::new(cfg);
 
-        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
 
         // Missing auth -> 407
         let req = Request::builder().method("GET").uri("/stats").body(Empty::<Bytes>::new()).unwrap();
@@ -2033,6 +2226,114 @@ mod tests {
         assert!(!lower.contains("proxy-authorization"));
         assert!(!lower.contains("proxy-connection"));
         assert!(lower.contains("host: example.com"));
+    }
+
+    #[tokio::test]
+    async fn non_connect_https_absolute_uri_is_rejected() {
+        use hyper::Request;
+
+        let port = 18091u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        let (upstream_addr, upstream_task) = spawn_fake_socks_upstream().await;
+
+        let mut cfg = base_proxy_config(port);
+        cfg.socks_addr = upstream_addr;
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://example.com/path")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let resp = sender.send_request(req).await.expect("send https absolute uri");
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn non_connect_absolute_http_uri_is_forwarded_as_origin_form() {
+        use hyper::Request;
+
+        let port = 18092u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        let (upstream_addr, captured, upstream_task) = spawn_capturing_socks_upstream().await;
+
+        let mut cfg = base_proxy_config(port);
+        cfg.socks_addr = upstream_addr;
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) = spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/path?q=1")
+            .header(hyper::header::HOST, "example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let resp = sender.send_request(req).await.expect("send absolute http uri");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+        let _ = upstream_task.await;
+
+        let captured_bytes = captured.lock().await.clone();
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+        assert!(
+            captured_str.starts_with("GET /path?q=1 HTTP/1.1\r\n"),
+            "unexpected upstream request: {captured_str:?}"
+        );
+        assert!(!captured_str.contains("GET http://example.com"));
+        assert!(captured_str.to_lowercase().contains("host: example.com"));
+    }
+
+    #[tokio::test]
+    async fn non_connect_absolute_http_uri_without_host_header_synthesizes_host() {
+        use tokio::io::AsyncWriteExt;
+
+        let port = 18093u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        let (upstream_addr, captured, upstream_task) = spawn_capturing_socks_upstream().await;
+
+        let mut cfg = base_proxy_config(port);
+        cfg.socks_addr = upstream_addr;
+        let config = Arc::new(cfg);
+        let (mut raw_client, server) =
+            spawn_raw_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        raw_client
+            .write_all(b"GET http://example.com/path?q=1 HTTP/1.1\r\nUser-Agent: raw-test\r\n\r\n")
+            .await
+            .expect("write raw request without host");
+        let response = read_until_header_end(&mut raw_client, Duration::from_secs(1)).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "unexpected proxy response: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        let _ = raw_client.shutdown().await;
+        let _ = server.await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), upstream_task)
+            .await
+            .expect("capturing upstream should finish");
+
+        let captured_bytes = captured.lock().await.clone();
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+        assert!(
+            captured_str.starts_with("GET /path?q=1 HTTP/1.1\r\n"),
+            "unexpected upstream request: {captured_str:?}"
+        );
+        assert!(captured_str.to_lowercase().contains("host: example.com"));
     }
 
     #[tokio::test]

@@ -212,6 +212,7 @@ Notes:
 - Pair with `--conn-per-ip` to bound per-client impact during spikes; start with 500 and tune based on upstream capacity and concurrency patterns.
 
 - CONNECT (HTTPS tunneling) is unaffected by `--force-close` and will remain stable with the existing idle timeout.
+- Non-CONNECT proxy requests must use absolute-form `http://...` request targets. HTTPS traffic should use CONNECT (standard HTTP proxy clients such as curl do this automatically), and accepted HTTP targets are rewritten to origin-form before forwarding upstream while preserving or synthesizing Host.
 - Keep the idle timeout (`--idle-timeout`, default 540s) aligned with your operational requirements. For CONNECT tunnels it acts as an idle timer (resets on traffic; closes after a quiet window). For normal HTTP (non-CONNECT) requests it acts as a per-request timeout: exceeding it aborts the upstream connection and returns 504 Gateway Timeout. Lower the value to reclaim idle/stuck connections more aggressively in resource-constrained environments.
 
 ### Examples
