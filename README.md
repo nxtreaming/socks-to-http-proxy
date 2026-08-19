@@ -159,6 +159,9 @@ Options:
       --conn-per-ip <CONN_PER_IP>          Maximum connections per client IP [default: 500]
       --stats-dir <STATS_DIR>              Directory to persist traffic stats files (per-port). Default: current dir
       --stats-interval <SECONDS>           Interval seconds to log and persist traffic stats [default: 60]
+      --stats-sync-from <URL>              Pull GET /stats from an old instance (use old IP, not the migrating domain)
+                                           Optional user:pass in URL, otherwise --http-basic is reused
+      --stats-sync-interval <SECONDS>      Interval seconds for --stats-sync-from [default: 5]
 
   -h, --help                               Print help information
   -V, --version                            Print version information
@@ -299,20 +302,44 @@ Recommendations:
 ## Traffic Statistics
 
 - Per-port cumulative byte counters (RX from client, TX to client)
-- Persistence: one file per listening port: `traffic_stats_{port}.txt` in `--stats-dir` (default: current directory)
-- Persistence writes for the same port are serialized, so periodic saves and `POST /stats/reset` cannot race on the same stats file.
+- Persistence: one file per listening port: `traffic_stats_{port}.txt` in `--stats-dir` (default: current directory). Older 3- and 5-field files still load; extra fields store sync watermarks, epochs, and retired source generations. Oversized retired lists from earlier builds are truncated to 32 on load.
+- Persistence writes for the same port are serialized, so periodic saves, `POST /stats/add`, and `POST /stats/reset` cannot race on the same stats file.
 - Periodic logging and persistence every `--stats-interval` seconds (default: 60)
-- Management endpoints (apply the same HTTP auth policy as the proxy itself):
-  - `GET /stats` → `{"port":<u16>,"rx":<u64>,"tx":<u64>}`
-  - `POST /stats/reset` → `{"ok":true}` and immediately persists zeros
+- Management endpoints (apply the same HTTP auth policy as the proxy itself). Only origin-form requests, loopback, the specific listen IP, or hosts listed in `--stats-host` are handled locally; other absolute-form URIs are forwarded. Binding `0.0.0.0`/`::` does **not** treat arbitrary IP literals as local:
+  - `GET /stats` → `{"port":<u16>,"rx":<u64>,"tx":<u64>,"epoch":<u64>}` (`epoch` is a counter generation: new each process start, incremented on `POST /stats/reset`, not restored from the stats file). `rx`/`tx`/`epoch` are read as one generation snapshot so a concurrent reset cannot pair pre-reset totals with the new epoch.
+  - `POST /stats/add` → body is strict JSON matching `GET /stats` (`{"rx":<u64>,"tx":<u64>}`; optional `port` is ignored; optional `epoch` binds the watermark to that source generation; `epoch` 0 is ignored as unknown/legacy). Treats those values as the **old instance's absolute counters** and adds only the positive delta since the last sync. Same-epoch samples that go backwards are ignored. A generation that has already been replaced is never reactivated by a delayed sample. At most 32 retired generations are stored; further unknown epochs are ignored instead of evicting older ones. When HTTP auth is disabled, this endpoint accepts only loopback clients; with `--http-basic`, it uses the same credentials as the proxy. `--stats-sync-from` does not use this HTTP route. Returns `{"ok":true,"port":<u16>,"added_rx":<u64>,"added_tx":<u64>,"rx":<u64>,"tx":<u64>}`
+  - `POST /stats/reset` → `{"ok":true}` after the reset snapshot is persisted (zeros for bytes that existed at the start of the call). Concurrent proxy bytes are kept and written once more; a later follow-up persist failure still returns success because the reset already committed. HTTP 500 means the reset was **not** applied. The local `epoch` is incremented so peers treat post-reset counters as a new generation. Sync watermarks on this instance are kept, so `--stats-sync-from` will not re-import the old instance's historical totals.
+- `--stats-host HOST` (repeatable) allows a domain or IP in absolute-form management URIs, e.g. scrapers that call `http://api.example.com:12323/stats` through this proxy, or `http://PUBLIC_IP:12323/stats` when listening on `0.0.0.0`. Without it, that request is forwarded instead of returning local stats.
+- `--stats-sync-from http://OLD_IP:PORT/stats` pulls the old instance automatically every `--stats-sync-interval` seconds and applies the same watermark sync. Use the **old IPv4 address**, not the migrating domain (IPv6 sync URLs are not supported). DNS lookup, connect, and HTTP I/O share a 10s timeout so a stuck resolver cannot block retries. If the old instance is down, sync failures do not change local counters. If the old instance's `epoch` changes (restart or `/stats/reset`), both watermarks move to the newly observed totals so later growth is imported; totals already on this instance are not subtracted, and the previous generation is retired so delayed samples cannot revive it. After 32 retired generations, additional unknown epochs are ignored rather than adopted. A lower rx/tx with the same `epoch` is ignored as a stale sample. Sources that omit `epoch` (or send `epoch` 0) also keep watermarks on a dip, so restart detection needs a non-zero `epoch`. If the old `/stats` requires HTTP proxy auth, either keep `--http-basic user:pass` on the new process (credentials are reused) or put them in the URL: `http://user:pass@OLD_IP:PORT/stats`.
 
 - In dual-listener mode, these endpoints are available only on the HTTP listener.
 
 Examples:
 ```bash
-# If authentication is required (recommended), include Proxy-Authorization
+# Prefer origin-form or loopback (works without --stats-host).
+# A public-IP absolute URI needs --stats-host when listening on 0.0.0.0.
 curl -s http://127.0.0.1:8080/stats \
   -H "Proxy-Authorization: Basic $(printf 'user:pass' | base64)"
+
+# DNS cutover: start the new server so it keeps importing the old server's growing counters.
+# Point --stats-sync-from at the old IP so it still works after the domain already points here.
+# If collectors scrape via a domain (curl -x ... http://api.example.com:12323/stats), add --stats-host.
+# Auth: --http-basic is reused for GET /stats on the old host (same as curl -x user:pass@...).
+sthp -p 12323 -s 127.0.0.1:1080 \
+  --http-basic username:passwd \
+  --stats-host api.example.com \
+  --stats-sync-from http://OLD_IP:12323/stats \
+  --stats-sync-interval 5
+
+# Equivalent: put the proxy user:pass in the sync URL instead of relying on --http-basic reuse
+# --stats-sync-from http://username:passwd@OLD_IP:12323/stats
+
+# Manual catch-up (same watermark logic; repeat until the old IP is dead)
+OLD_STATS=$(curl -s -x http://user:pass@OLD_IP:8080 http://OLD_IP:8080/stats)
+curl -s -X POST http://NEW_IP:8080/stats/add \
+  -H "Proxy-Authorization: Basic $(printf 'user:pass' | base64)" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$OLD_STATS"
 
 # Reset counters and persist immediately
 curl -s -X POST http://127.0.0.1:8080/stats/reset \

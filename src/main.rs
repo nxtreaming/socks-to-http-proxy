@@ -19,8 +19,11 @@ use crate::session::new_session_id;
 use crate::socks::SocksConnector;
 
 use crate::traffic::{
-    get_counters_for_port, load_from_file, reset_port, save_port_to_file, snapshot, TrafficCounters,
+    get_counters_for_port, load_from_file, parse_stats_add_json, parse_stats_sync_url,
+    reset_port_and_save, save_port_to_file, sync_source_and_save_with_epoch, TrafficCounters,
 };
+#[cfg(test)]
+use crate::traffic::{reset_port, snapshot};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use hyper::body::{Body, Frame, SizeHint};
@@ -239,6 +242,8 @@ async fn main() -> Result<()> {
         });
     }
 
+    spawn_stats_sync_task(Arc::clone(&config), listen_port, stats_path.clone());
+
     // If an additional SOCKS listener is configured, initialize its counters and stats tasks
     let (socks_extra_listener, traffic_counters_socks, _stats_path_socks) = if let Some(saddr) = &config.socks_listen_addr {
         let sport = saddr.port();
@@ -406,7 +411,7 @@ async fn main() -> Result<()> {
                             let counters = Arc::clone(&traffic_counters2);
                             let service = service_fn(move |req| {
                                 proxy(
-                                    req,
+                                    insert_peer_ip(req, peer_addr.ip()),
                                     Arc::clone(&socks_connector),
                                     Arc::clone(&http_basic),
                                     Arc::clone(&allowed_domains),
@@ -527,23 +532,43 @@ async fn proxy(
     if let Some(resp) = check_proxy_auth(req.headers(), http_basic.as_ref(), config.no_httpauth) {
         return Ok(resp);
     }
-    // Management endpoints (require auth if enabled)
-    // Reset first
-    if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
-        let port = config.listen_addr.port();
-        reset_port(port).await;
-        let stats_path = get_stats_path(&config, port);
-        if let Err(e) = save_port_to_file(port, &stats_path).await {
-            warn!("Failed to persist stats after reset: {}", e);
+    // Management endpoints (require auth if enabled). Absolute-form URIs are
+    // only handled locally when aimed at this listener; otherwise they are
+    // forwarded like any other proxy request.
+    if is_local_management_target(req.uri(), config.listen_addr, &config.stats_hosts) {
+        if req.method() == Method::POST && req.uri().path() == "/stats/reset" {
+            let port = config.listen_addr.port();
+            let stats_path = get_stats_path(&config, port);
+            return Ok(match reset_port_and_save(port, &stats_path).await {
+                Ok(()) => json_response("{\"ok\":true}".to_string()),
+                Err(e) => {
+                    warn!("Failed to persist stats after reset: {}", e);
+                    json_status_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "{\"ok\":false,\"error\":\"failed to persist stats\"}".to_string(),
+                    )
+                }
+            });
         }
-        return Ok(json_response("{\"ok\":true}".to_string()));
-    }
-    // Then GET stats
-    if req.method() == Method::GET && req.uri().path() == "/stats" {
-        let port = config.listen_addr.port();
-        let (rx, tx) = snapshot(port).await.unwrap_or((0, 0));
-        let body = format!("{{\"port\":{},\"rx\":{},\"tx\":{}}}", port, rx, tx);
-        return Ok(json_response(body));
+        if req.method() == Method::POST && req.uri().path() == "/stats/add" {
+            if !stats_add_from_peer_allowed(config.no_httpauth, peer_ip_from_request(&req)) {
+                return Ok(json_status_response(
+                    http::StatusCode::FORBIDDEN,
+                    "{\"ok\":false,\"error\":\"stats add requires authentication or a loopback client\"}".to_string(),
+                ));
+            }
+            return Ok(handle_stats_add(req, config.as_ref()).await);
+        }
+        if req.method() == Method::GET && req.uri().path() == "/stats" {
+            let port = config.listen_addr.port();
+            let counters = get_counters_for_port(port).await;
+            let (rx, tx, epoch) = counters.snapshot_generation();
+            let body = format!(
+                "{{\"port\":{},\"rx\":{},\"tx\":{},\"epoch\":{}}}",
+                port, rx, tx, epoch
+            );
+            return Ok(json_response(body));
+        }
     }
 
     if Method::CONNECT == req.method() {
@@ -941,6 +966,312 @@ fn json_response(body: String) -> Response<BoxBody<Bytes, hyper::Error>> {
         HeaderValue::from_static("application/json"),
     );
     resp
+}
+
+fn json_status_response(
+    status: http::StatusCode,
+    body: String,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = json_response(body);
+    *resp.status_mut() = status;
+    resp
+}
+
+const STATS_ADD_BODY_MAX: usize = 4096;
+const STATS_SYNC_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn insert_peer_ip<B>(mut req: Request<B>, peer_ip: std::net::IpAddr) -> Request<B> {
+    req.extensions_mut().insert(peer_ip);
+    req
+}
+
+fn peer_ip_from_request<B>(req: &Request<B>) -> Option<std::net::IpAddr> {
+    req.extensions().get::<std::net::IpAddr>().copied()
+}
+
+/// POST /stats/add mutates watermark/generation state. When proxy auth is off,
+/// only loopback clients may call it; `--stats-sync-from` does not use this route.
+fn stats_add_from_peer_allowed(no_httpauth: bool, peer_ip: Option<std::net::IpAddr>) -> bool {
+    if !no_httpauth {
+        return true;
+    }
+    peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+fn is_local_management_target(
+    uri: &http::Uri,
+    listen: std::net::SocketAddr,
+    extra_hosts: &[String],
+) -> bool {
+    if uri.scheme().is_none() && uri.authority().is_none() {
+        return true;
+    }
+    if uri.scheme_str() != Some("http") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.port_u16().unwrap_or(80) != listen.port() {
+        return false;
+    }
+    management_host_allowed(authority.host(), listen, extra_hosts)
+}
+
+fn management_host_allowed(
+    host: &str,
+    listen: std::net::SocketAddr,
+    extra_hosts: &[String],
+) -> bool {
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if extra_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)) {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => true,
+        Ok(ip) => ip == listen.ip(),
+        Err(_) => false,
+    }
+}
+
+async fn collect_body_limited<B>(mut body: B, max: usize) -> Result<Bytes, &'static str>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let mut acc = Vec::new();
+    loop {
+        match body.frame().await {
+            None => break,
+            Some(Err(_)) => return Err("failed to read request body"),
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if acc.len().saturating_add(data.len()) > max {
+                        return Err("request body too large");
+                    }
+                    acc.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+    Ok(Bytes::from(acc))
+}
+
+/// POST /stats/add — accumulate another server's GET /stats payload into this listener.
+async fn handle_stats_add(
+    req: Request<hyper::body::Incoming>,
+    config: &ProxyConfig,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = match tokio::time::timeout(
+        STATS_SYNC_IO_TIMEOUT,
+        collect_body_limited(req.into_body(), STATS_ADD_BODY_MAX),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(msg)) => {
+            return json_status_response(
+                http::StatusCode::BAD_REQUEST,
+                format!("{{\"ok\":false,\"error\":\"{}\"}}", msg),
+            );
+        }
+        Err(_) => {
+            return json_status_response(
+                http::StatusCode::BAD_REQUEST,
+                "{\"ok\":false,\"error\":\"request body timeout\"}".to_string(),
+            );
+        }
+    };
+
+    let json = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            return json_status_response(
+                http::StatusCode::BAD_REQUEST,
+                "{\"ok\":false,\"error\":\"body must be utf-8 json\"}".to_string(),
+            );
+        }
+    };
+
+    let Some(parsed) = parse_stats_add_json(json) else {
+        return json_status_response(
+            http::StatusCode::BAD_REQUEST,
+            "{\"ok\":false,\"error\":\"expected json object with integer rx and tx\"}".to_string(),
+        );
+    };
+
+    let port = config.listen_addr.port();
+    let stats_path = get_stats_path(config, port);
+    match sync_source_and_save_with_epoch(
+        port,
+        parsed.rx,
+        parsed.tx,
+        parsed.epoch,
+        &stats_path,
+    )
+    .await {
+        Ok(result) => json_response(format!(
+            "{{\"ok\":true,\"port\":{},\"added_rx\":{},\"added_tx\":{},\"rx\":{},\"tx\":{}}}",
+            port, result.added_rx, result.added_tx, result.rx, result.tx
+        )),
+        Err(e) => {
+            warn!("Failed to persist stats after add: {}", e);
+            json_status_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"ok\":false,\"error\":\"failed to persist stats\"}".to_string(),
+            )
+        }
+    }
+}
+
+fn spawn_stats_sync_task(config: Arc<ProxyConfig>, listen_port: u16, stats_path: PathBuf) {
+    let Some(url) = config.stats_sync_from.clone() else {
+        return;
+    };
+    let Ok(target) = parse_stats_sync_url(&url) else {
+        warn!("Ignoring invalid --stats-sync-from URL");
+        return;
+    };
+    let interval = config.stats_sync_interval.max(1);
+    let auth = match target.basic_credentials.as_deref() {
+        Some(user_pass) => match proxy_basic_header(user_pass) {
+            Ok(header) => Some(header),
+            Err(e) => {
+                warn!("Ignoring --stats-sync-from credentials: {}", e);
+                return;
+            }
+        },
+        None => config.http_basic_auth.clone(),
+    };
+    let host = target.host;
+    let port = target.port;
+    let path = target.path;
+    info!(
+        "Stats sync from {}:{}{} every {}s into local port {}",
+        host, port, path, interval, listen_port
+    );
+    tokio::spawn(async move {
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            match fetch_remote_stats(&host, port, &path, &auth).await {
+                Ok(parsed) => {
+                    if consecutive_failures > 0 {
+                        info!(
+                            "Stats sync from {}:{} recovered after {} failed attempt(s)",
+                            host, port, consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                    match sync_source_and_save_with_epoch(
+                        listen_port,
+                        parsed.rx,
+                        parsed.tx,
+                        parsed.epoch,
+                        &stats_path,
+                    )
+                    .await {
+                        Ok(result) => {
+                            if result.added_rx > 0 || result.added_tx > 0 {
+                                info!(
+                                    "Stats sync added rx={}B tx={}B (local rx={}B tx={}B)",
+                                    result.added_rx, result.added_tx, result.rx, result.tx
+                                );
+                            }
+                        }
+                        Err(e) => warn!("Failed to persist stats sync: {}", e),
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures <= 3 {
+                        warn!("Stats sync from {}:{} failed: {}", host, port, e);
+                    } else if consecutive_failures == 4 {
+                        warn!(
+                            "Stats sync from {}:{} is unreachable; backing off retries (last error: {})",
+                            host, port, e
+                        );
+                    }
+                }
+            }
+            let sleep_secs = if consecutive_failures >= 4 {
+                interval.max(60)
+            } else {
+                interval
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+        }
+    });
+}
+
+async fn fetch_remote_stats(
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: &Option<HeaderValue>,
+) -> Result<crate::traffic::ParsedStats, String> {
+    let mut addrs = tokio::time::timeout(
+        STATS_SYNC_IO_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| format!("resolve {}:{} timeout", host, port))?
+    .map_err(|e| format!("resolve {}:{}: {}", host, port, e))?;
+    let addr = addrs.next().ok_or_else(|| format!("no addresses for {}:{}", host, port))?;
+    let stream = tokio::time::timeout(STATS_SYNC_IO_TIMEOUT, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("connect: {}", e))?;
+
+    let (mut sender, conn) = tokio::time::timeout(
+        STATS_SYNC_IO_TIMEOUT,
+        Builder::new().handshake(TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| "http handshake timeout".to_string())?
+    .map_err(|e| format!("http handshake: {}", e))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(HOST, format!("{}:{}", host, port));
+    if let Some(auth) = auth {
+        req = req.header(PROXY_AUTHORIZATION, auth.clone());
+    }
+    let req = req.body(Empty::<Bytes>::new()).map_err(|e| format!("build request: {}", e))?;
+    let resp = tokio::time::timeout(STATS_SYNC_IO_TIMEOUT, sender.send_request(req))
+        .await
+        .map_err(|_| "stats request timeout".to_string())?
+        .map_err(|e| format!("stats request: {}", e))?;
+    if resp.status() != http::StatusCode::OK {
+        return Err(format!("status {}", resp.status()));
+    }
+    let body = tokio::time::timeout(
+        STATS_SYNC_IO_TIMEOUT,
+        collect_body_limited(resp.into_body(), STATS_ADD_BODY_MAX),
+    )
+    .await
+    .map_err(|_| "stats body timeout".to_string())?
+    .map_err(|e| e.to_string())?;
+    let json = std::str::from_utf8(&body).map_err(|_| "stats body is not utf-8".to_string())?;
+    parse_stats_add_json(json).ok_or_else(|| "stats body missing integer rx/tx".to_string())
+}
+
+fn proxy_basic_header(user_pass: &str) -> Result<HeaderValue, String> {
+    use base64::engine::general_purpose;
+    use base64::Engine;
+    let mut parts = user_pass.splitn(2, ':');
+    let username = parts.next().unwrap_or("");
+    let password = parts.next().unwrap_or("");
+    if username.is_empty() || password.is_empty() {
+        return Err("expected user:pass".to_string());
+    }
+    let auth_str = format!("Basic {}", general_purpose::STANDARD.encode(user_pass));
+    HeaderValue::from_str(&auth_str).map_err(|_| "invalid user:pass".to_string())
 }
 
 fn proxy_auth_required_response(msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -1579,6 +1910,9 @@ fn base_proxy_config(port: u16) -> ProxyConfig {
         socks_in_auth: None,
         stats_dir: None,
         stats_interval: 60,
+        stats_sync_from: None,
+        stats_sync_interval: 5,
+        stats_hosts: Vec::new(),
         connpnt_settings: ConnpntSettings { enabled: false, base_user: None, country: None, keeptime_minutes: 0, project: None, entry_hosts: vec![], socks_port: 9135 },
         socks_weights: None,
     }
@@ -1603,6 +1937,46 @@ async fn spawn_in_memory_proxy(
     JoinHandle<()>,
     JoinHandle<()>,
 ) {
+    spawn_in_memory_proxy_for(config, counters).await
+}
+
+#[cfg(test)]
+async fn spawn_in_memory_proxy_for<B>(
+    config: Arc<ProxyConfig>,
+    counters: Arc<TrafficCounters>,
+) -> (
+    hyper::client::conn::http1::SendRequest<B>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+)
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    spawn_in_memory_proxy_for_peer(
+        config,
+        counters,
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn spawn_in_memory_proxy_for_peer<B>(
+    config: Arc<ProxyConfig>,
+    counters: Arc<TrafficCounters>,
+    peer_ip: std::net::IpAddr,
+) -> (
+    hyper::client::conn::http1::SendRequest<B>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+)
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     use hyper::client::conn::http1::Builder;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
@@ -1624,7 +1998,7 @@ async fn spawn_in_memory_proxy(
     let server = tokio::spawn(async move {
         let service = service_fn(move |req| {
             proxy(
-                req,
+                insert_peer_ip(req, peer_ip),
                 Arc::clone(&socks),
                 Arc::clone(&http_basic),
                 Arc::clone(&allowed),
@@ -1646,7 +2020,7 @@ async fn spawn_in_memory_proxy(
     let (sender, conn) = Builder::new()
         .preserve_header_case(true)
         .title_case_headers(true)
-        .handshake(TokioIo::new(client_io))
+        .handshake::<_, B>(TokioIo::new(client_io))
         .await
         .expect("client handshake");
     let client_task = tokio::spawn(async move {
@@ -1718,7 +2092,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let service = service_fn(move |req| {
                 proxy(
-                    req,
+                    insert_peer_ip(req, std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)),
                     Arc::clone(&socks),
                     Arc::clone(&http_basic),
                     Arc::clone(&allowed),
@@ -2023,6 +2397,7 @@ mod tests {
         let body = String::from_utf8_lossy(&body_bytes);
         assert!(body.contains("\"rx\":123"));
         assert!(body.contains("\"tx\":456"));
+        assert!(body.contains("\"epoch\":"));
 
         // POST /stats/reset should zero the counters
         let req = Request::builder().method("POST").uri("/stats/reset").body(Empty::<Bytes>::new()).unwrap();
@@ -2030,6 +2405,495 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         let snapshot_after = snapshot(port).await.unwrap_or((0, 0));
         assert_eq!(snapshot_after, (0, 0));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stats_add_endpoint_accumulates_old_counters() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18110u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_add_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy_for::<Full<Bytes>>(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/stats/add")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(
+                "{\"port\":12323,\"rx\":100,\"tx\":200}",
+            )))
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send stats add");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"ok\":true"));
+        assert!(body.contains("\"added_rx\":100"));
+        assert!(body.contains("\"added_tx\":200"));
+        assert!(body.contains("\"rx\":110"));
+        assert!(body.contains("\"tx\":220"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (110, 220));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/stats/add")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(
+                "{\"port\":12323,\"rx\":100,\"tx\":200}",
+            )))
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("repeat stats add");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"added_rx\":0"));
+        assert!(body.contains("\"added_tx\":0"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (110, 220));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/stats/add")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":130,\"tx\":250}")))
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("delta stats add");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"added_rx\":30"));
+        assert!(body.contains("\"added_tx\":50"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (140, 270));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/stats/add")
+            .body(Full::new(Bytes::from("{\"rx\":1}")))
+            .unwrap();
+        let resp = sender
+            .send_request(req)
+            .await
+            .expect("send invalid stats add");
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (140, 270));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[test]
+    fn stats_add_from_peer_allowed_requires_auth_or_loopback() {
+        assert!(stats_add_from_peer_allowed(
+            true,
+            Some(std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST))
+        ));
+        assert!(stats_add_from_peer_allowed(
+            true,
+            Some(std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST))
+        ));
+        assert!(!stats_add_from_peer_allowed(
+            true,
+            Some(std::net::IpAddr::from([203, 0, 113, 10]))
+        ));
+        assert!(!stats_add_from_peer_allowed(true, None));
+        assert!(stats_add_from_peer_allowed(
+            false,
+            Some(std::net::IpAddr::from([203, 0, 113, 10]))
+        ));
+        assert!(stats_add_from_peer_allowed(false, None));
+    }
+
+    #[tokio::test]
+    async fn stats_add_rejects_unauthenticated_non_loopback_peer() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18121u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+        counters.set_sync_mark(0, 0);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_add_remote_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) = spawn_in_memory_proxy_for_peer::<Full<Bytes>>(
+            Arc::clone(&config),
+            counters.clone(),
+            std::net::IpAddr::from([203, 0, 113, 10]),
+        )
+        .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/stats/add")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":100,\"tx\":200,\"epoch\":1}")))
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send remote stats add");
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"ok\":false"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (10, 20));
+        assert_eq!(counters.sync_mark(), (0, 0));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stats_add_rejects_absolute_uri_to_other_hosts() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18111u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+        counters.set_sync_mark(0, 0);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_add_abs_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy_for::<Full<Bytes>>(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://attacker.example:{}/stats/add", port))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":999,\"tx\":999}")))
+            .unwrap();
+        let resp = sender
+            .send_request(req)
+            .await
+            .expect("send absolute stats add");
+        assert_ne!(resp.status(), http::StatusCode::OK);
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (10, 20));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{}/stats/add", port))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":100,\"tx\":200}")))
+            .unwrap();
+        let mut resp = sender
+            .send_request(req)
+            .await
+            .expect("send local absolute stats add");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"ok\":true"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (110, 220));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[test]
+    fn local_management_target_origin_form_and_loopback() {
+        let listen: std::net::SocketAddr = "0.0.0.0:12323".parse().unwrap();
+        let none: [String; 0] = [];
+        assert!(is_local_management_target(
+            &"/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(is_local_management_target(
+            &"/stats/add".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(is_local_management_target(
+            &"http://127.0.0.1:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(is_local_management_target(
+            &"http://localhost:12323/stats/reset".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(is_local_management_target(
+            &"http://[::1]:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+    }
+
+    #[test]
+    fn local_management_target_unspecified_listen_rejects_arbitrary_ip_literal() {
+        let listen: std::net::SocketAddr = "0.0.0.0:12323".parse().unwrap();
+        let none: [String; 0] = [];
+        assert!(!is_local_management_target(
+            &"http://203.0.113.10:12323/stats/add".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://8.8.8.8:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://attacker.example:12323/stats/add".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://attacker.example:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://attacker.example:12323/stats/reset".parse().unwrap(),
+            listen,
+            &none
+        ));
+        let extra = ["203.0.113.10".to_string()];
+        assert!(is_local_management_target(
+            &"http://203.0.113.10:12323/stats/add".parse().unwrap(),
+            listen,
+            &extra
+        ));
+    }
+
+    #[test]
+    fn local_management_target_specific_listen_and_stats_host() {
+        let listen: std::net::SocketAddr = "1.2.3.4:12323".parse().unwrap();
+        let none: [String; 0] = [];
+        assert!(is_local_management_target(
+            &"http://1.2.3.4:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://203.0.113.10:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        assert!(!is_local_management_target(
+            &"http://api.wiretunnel.com:12323/stats".parse().unwrap(),
+            listen,
+            &none
+        ));
+        let extra = ["api.wiretunnel.com".to_string()];
+        assert!(is_local_management_target(
+            &"http://api.wiretunnel.com:12323/stats".parse().unwrap(),
+            listen,
+            &extra
+        ));
+        assert!(is_local_management_target(
+            &"http://API.WireTunnel.com:12323/stats/add".parse().unwrap(),
+            listen,
+            &extra
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stats_management_on_unspecified_listen_rejects_public_ip_without_stats_host() {
+        use http_body_util::Full;
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18116u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+        counters.set_sync_mark(0, 0);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_add_unspec_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy_for::<Full<Bytes>>(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://203.0.113.10:{}/stats/add", port))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":100,\"tx\":200}")))
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("public ip stats add");
+        assert_ne!(resp.status(), http::StatusCode::OK);
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (10, 20));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stats_management_on_unspecified_listen_accepts_stats_host_ip() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18119u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+        counters.set_sync_mark(0, 0);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        cfg.stats_hosts = vec!["203.0.113.10".to_string()];
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_add_unspec_host_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy_for::<Full<Bytes>>(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://203.0.113.10:{}/stats/add", port))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from("{\"rx\":100,\"tx\":200}")))
+            .unwrap();
+        let mut resp = sender
+            .send_request(req)
+            .await
+            .expect("stats-host ip stats add");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"ok\":true"));
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (110, 220));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stats_get_and_reset_reject_absolute_uri_to_other_hosts() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18117u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(10, 20);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_mgmt_abs_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy_for::<Full<Bytes>>(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://attacker.example:{}/stats", port))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send attacker stats");
+        assert_ne!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(!body.contains("\"rx\":10"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://attacker.example:{}/stats/reset", port))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("send attacker reset");
+        assert_ne!(resp.status(), http::StatusCode::OK);
+        assert_eq!(snapshot(port).await.unwrap_or((0, 0)), (10, 20));
+
+        drop(sender);
+        let _ = client_task.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stats_host_allows_domain_absolute_uri() {
+        use http_body_util::BodyExt;
+        use hyper::Request;
+        use std::sync::Arc;
+
+        let port = 18118u16;
+        reset_port(port).await;
+        let counters = get_counters_for_port(port).await;
+        counters.set(7, 8);
+
+        let mut cfg = base_proxy_config(port);
+        cfg.stats_hosts = vec!["api.wiretunnel.com".to_string()];
+        cfg.stats_dir = Some(
+            std::env::temp_dir()
+                .join(format!("sthp_test_stats_host_{}", port))
+                .to_string_lossy()
+                .to_string(),
+        );
+        let config = Arc::new(cfg);
+        let (mut sender, client_task, server) =
+            spawn_in_memory_proxy(Arc::clone(&config), counters.clone()).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://api.wiretunnel.com:{}/stats", port))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let mut resp = sender.send_request(req).await.expect("send domain stats");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body_bytes = resp.body_mut().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("\"rx\":7"));
+        assert!(body.contains("\"tx\":8"));
 
         drop(sender);
         let _ = client_task.await;
@@ -2623,10 +3487,10 @@ mod tests {
             let cfg_h = Arc::clone(&cfg); let sc_h = Arc::clone(&socks_connector); let allowed_h = Arc::clone(&allowed); let http_basic_h = Arc::clone(&http_basic); let counters_h = Arc::clone(&counters_http);
             let h_task = tokio::spawn(async move {
                 loop {
-                    let (stream, _) = match http_listener.accept().await { Ok(v)=>v, Err(_)=>break };
+                    let (stream, peer) = match http_listener.accept().await { Ok(v)=>v, Err(_)=>break };
                     let sc = Arc::clone(&sc_h); let hb = Arc::clone(&http_basic_h); let ad = Arc::clone(&allowed_h); let cfg = Arc::clone(&cfg_h); let counters = Arc::clone(&counters_h);
                     tokio::spawn(async move {
-                        let svc = service_fn(move |req| proxy(req, Arc::clone(&sc), Arc::clone(&hb), Arc::clone(&ad), Arc::clone(&cfg), None, Arc::clone(&counters)));
+                        let svc = service_fn(move |req| proxy(insert_peer_ip(req, peer.ip()), Arc::clone(&sc), Arc::clone(&hb), Arc::clone(&ad), Arc::clone(&cfg), None, Arc::clone(&counters)));
                         let _ = http1::Builder::new().preserve_header_case(true).title_case_headers(true).serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
                     });
                 }

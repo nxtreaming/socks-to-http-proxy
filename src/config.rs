@@ -44,7 +44,7 @@ pub struct Auths {
 #[command(
     author, version,
     about = "SOCKS/HTTP proxy forwarder",
-    long_about = "sthp converts between protocols and forwards via an upstream SOCKS5 proxy.\n\nModes:\n- http  : HTTP proxy -> upstream SOCKS5 (existing)\n- socks : SOCKS5 proxy -> upstream SOCKS5 (new)\n\nFeatures:\n- Optional HTTP Basic or inbound SOCKS5 auth\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints (HTTP mode only): GET /stats, POST /stats/reset\n"
+    long_about = "sthp converts between protocols and forwards via an upstream SOCKS5 proxy.\n\nModes:\n- http  : HTTP proxy -> upstream SOCKS5 (existing)\n- socks : SOCKS5 proxy -> upstream SOCKS5 (new)\n\nFeatures:\n- Optional HTTP Basic or inbound SOCKS5 auth\n- Domain allowlist\n- Connection caps and idle timeout\n- Traffic statistics with persistence (--stats-dir, --stats-interval)\n- Management endpoints (HTTP mode only): GET /stats, POST /stats/add, POST /stats/reset\n- Optional watermark sync from an old instance (--stats-sync-from) during DNS cutover\n- Optional --stats-host for domain-based collectors of GET /stats\n"
 )]
 
 pub struct Cli {
@@ -200,6 +200,23 @@ pub struct Cli {
     /// Interval seconds to log and persist traffic stats
     #[arg(long = "stats-interval", default_value_t = 60)]
     pub stats_interval: u64,
+
+    /// Pull GET /stats from an old instance and watermark-sync into this process.
+    /// Use the old server IPv4 address (not the migrating domain; IPv6 URLs are not supported).
+    /// Optional `http://user:pass@host:port/stats`; otherwise the new process `--http-basic`
+    /// credentials are sent as Proxy-Authorization. DNS lookup shares the sync I/O timeout.
+    #[arg(long = "stats-sync-from")]
+    pub stats_sync_from: Option<String>,
+
+    /// Interval seconds for --stats-sync-from pulls [default: 5]
+    #[arg(long = "stats-sync-interval", default_value_t = 5)]
+    pub stats_sync_interval: u64,
+
+    /// Hostname or IP allowed in absolute-form management URIs (GET /stats, POST /stats/add, POST /stats/reset).
+    /// Repeatable. Required when scrapers use a domain or, with `--listen-ip 0.0.0.0`, a non-loopback IP
+    /// rather than origin-form. Origin-form, loopback, and the specific listen IP do not need this.
+    #[arg(long = "stats-host", value_name = "HOST", action = clap::ArgAction::Append)]
+    pub stats_host: Vec<String>,
 }
 
 /// Connpnt-style vendor settings (dynamic username pattern)
@@ -391,9 +408,27 @@ pub struct ProxyConfig {
     pub socks_in_auth: Option<crate::auth::Auth>,
     pub stats_dir: Option<String>,
     pub stats_interval: u64,
+    /// Direct URL to an old instance's GET /stats (host should be the old IP)
+    pub stats_sync_from: Option<String>,
+    pub stats_sync_interval: u64,
+    /// Extra hostnames accepted as local management targets in absolute-form URIs
+    pub stats_hosts: Vec<String>,
     pub connpnt_settings: ConnpntSettings,
     /// Optional weights for two-provider mode (w1, w2)
     pub socks_weights: Option<(u32, u32)>,
+}
+
+fn normalize_stats_hosts(hosts: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in hosts {
+        for part in raw.split(',') {
+            let host = part.trim().to_ascii_lowercase();
+            if !host.is_empty() && !out.iter().any(|h| h == &host) {
+                out.push(host);
+            }
+        }
+    }
+    out
 }
 
 impl ProxyConfig {
@@ -407,6 +442,10 @@ impl ProxyConfig {
             return Err(color_eyre::eyre::eyre!(
                 "--idle-timeout must be at least 1 second"
             ));
+        }
+
+        if let Some(url) = &args.stats_sync_from {
+            crate::traffic::parse_stats_sync_url(url).map_err(|e| color_eyre::eyre::eyre!(e))?;
         }
 
         // Resolve primary SOCKS5 address (used in Standard/SOAX modes and as provider1 in multi-provider)
@@ -614,6 +653,9 @@ impl ProxyConfig {
             socks_in_auth,
             stats_dir: args.stats_dir.clone(),
             stats_interval: args.stats_interval,
+            stats_sync_from: args.stats_sync_from.clone(),
+            stats_sync_interval: args.stats_sync_interval.max(1),
+            stats_hosts: normalize_stats_hosts(&args.stats_host),
             connpnt_settings,
             socks_weights,
         })
@@ -770,6 +812,24 @@ sessionid-abcdef-sessionlength-300-bindttl-120-idlettl-60"
         assert!(
             err.to_string().contains("--allowed-domains"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_host_flags_are_trimmed_and_lowercased() {
+        let args = Cli::try_parse_from([
+            "sthp",
+            "--stats-host",
+            " API.Example.COM ",
+            "--stats-host",
+            "other.example,API.example.com",
+        ])
+        .expect("parse cli");
+
+        let config = ProxyConfig::from_cli(args).await.expect("build config");
+        assert_eq!(
+            config.stats_hosts,
+            vec!["api.example.com".to_string(), "other.example".to_string()]
         );
     }
 
